@@ -1,31 +1,41 @@
 #!/usr/bin/env bash
-# checkpoint.sh — Create RocksDB checkpoint and sync to S3.
+# checkpoint.sh — Create RocksDB checkpoint and sync to object storage.
 # Runs every 6h via systemd timer.
+#
+# Object storage sync (lines below marked [OBJECT STORAGE]) currently uses
+# the AWS CLI (`aws s3 sync`) targeting an S3-compatible endpoint.
+# To switch providers, replace those lines with the equivalent CLI for your
+# object storage service (e.g. `gsutil rsync` for GCS, `az storage blob sync`
+# for Azure Blob Storage, or `mc mirror` for any S3-compatible endpoint via MinIO Client).
+# The Rust binary itself has no object storage dependency — all sync happens here.
 set -euo pipefail
 
-S3_BUCKET="${S3_BUCKET:?S3_BUCKET required}"
+BUCKET="${OBJECT_STORE_BUCKET:-${S3_BUCKET:?OBJECT_STORE_BUCKET required}}"
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-/data/checkpoints}"
 METRICS_ADDR="${METRICS_ADDR:-0.0.0.0:9090}"
 HOST="http://127.0.0.1:${METRICS_ADDR##*:}"
-AWS_REGION="${AWS_REGION:-us-east-1}"
+REGION="${CLOUD_REGION:-${AWS_REGION:-us-east-1}}"
 
 TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ)
 LOCAL_PATH="$CHECKPOINT_PATH/$TIMESTAMP"
 
 echo "Creating checkpoint at $LOCAL_PATH"
 
-# POST to admin endpoint
+# POST to admin endpoint — triggers RocksDB hard-link snapshot
 curl -sf -X POST "$HOST/admin/checkpoint?path=$LOCAL_PATH" \
     || { echo "ERROR: checkpoint HTTP call failed" >&2; exit 1; }
 
-echo "Checkpoint created locally — syncing to S3"
+echo "Checkpoint created locally — syncing to object storage"
 
+# [OBJECT STORAGE] Upload checkpoint to S3-compatible object storage.
+# Replace this block to target a different cloud provider or CLI tool.
 aws s3 sync "$LOCAL_PATH/" \
-    "s3://$S3_BUCKET/checkpoints/$TIMESTAMP/" \
-    --region "$AWS_REGION" \
+    "s3://$BUCKET/checkpoints/$TIMESTAMP/" \
+    --region "$REGION" \
     --storage-class STANDARD_IA
+# [/OBJECT STORAGE]
 
-echo "S3 sync complete: s3://$S3_BUCKET/checkpoints/$TIMESTAMP/"
+echo "Sync complete: $BUCKET/checkpoints/$TIMESTAMP/"
 
 # Keep only last 2 local checkpoints
 ls -d "$CHECKPOINT_PATH"/*/  2>/dev/null \

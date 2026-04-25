@@ -1,6 +1,6 @@
 # RocksQueue
 
-A production-grade, RocksDB-backed multi-tenant task queue written in Rust. Targets 1,000+ tasks/second with hard noisy-neighbour isolation, adaptive scheduling, and self-healing single-node deployment on AWS.
+A production-grade, RocksDB-backed multi-tenant task queue written in Rust. Targets 1,000+ tasks/second with hard noisy-neighbour isolation, adaptive scheduling, and self-healing single-node deployment on any major cloud provider.
 
 ## Features
 
@@ -10,7 +10,7 @@ A production-grade, RocksDB-backed multi-tenant task queue written in Rust. Targ
 - **Compaction-based GC** — TTL filtering for pending, inflight, and DLQ tasks runs free during normal RocksDB compaction
 - **Adaptive throttling** — EMA stats + CUSUM drift detection auto-throttle noisy tenants without operator intervention
 - **Visibility timeout reaper** — inflight tasks past deadline are automatically re-queued
-- **Self-healing bootstrap** — restores from S3 checkpoint on fresh EC2 instance, zero manual steps
+- **Self-healing bootstrap** — restores from object storage checkpoint on a fresh instance, zero manual steps
 - **gRPC control plane** — 30 RPCs covering tenant lifecycle, policy, stats, throttle, baseline, and operations
 - **Persistent state** — stats, throttle decisions, and baselines survive restarts via `__system__` CF
 
@@ -106,10 +106,10 @@ CHECKPOINT_PATH=./data/checkpoints
 GRPC_ADDR=0.0.0.0:50051
 METRICS_ADDR=0.0.0.0:9090
 S3_BUCKET=rocksqueue-local
-S3_ENDPOINT=http://localhost:9000      # MinIO for local dev; omit for AWS
-AWS_ACCESS_KEY_ID=minioadmin
-AWS_SECRET_ACCESS_KEY=minioadmin
-AWS_REGION=us-east-1
+S3_ENDPOINT=http://localhost:9000      # MinIO for local dev; omit for cloud provider
+OBJECT_STORE_ACCESS_KEY=minioadmin
+OBJECT_STORE_SECRET_KEY=minioadmin
+CLOUD_REGION=us-east-1
 RUST_LOG=rocksqueue=debug
 ```
 
@@ -213,7 +213,7 @@ grpcurl -plaintext -d '{"tenant_id":"acme"}' \
 | Endpoint | Purpose |
 |---|---|
 | `GET /health` | Liveness — always `ok` |
-| `GET /ready` | Readiness — pings RocksDB; used by deploy script and ASG lifecycle hooks |
+| `GET /ready` | Readiness — pings RocksDB; used by deploy script and autoscaling lifecycle hooks |
 | `GET /metrics` | Prometheus scrape |
 | `POST /admin/checkpoint?path=<path>` | Create a RocksDB checkpoint at the given path |
 
@@ -228,11 +228,11 @@ grpcurl -plaintext -d '{"tenant_id":"acme"}' \
 ./scripts/dev.sh stats       # ListAllStats
 ```
 
-## Production deployment (AWS)
+## Production deployment
 
 ### Recommended instance
 
-`i4i.2xlarge` — local NVMe, 8 vCPU, 64 GB RAM.
+A storage-optimised instance with local NVMe, 8 vCPU, and 64 GB RAM (e.g. `i4i.2xlarge` class on most cloud providers).
 
 ### Storage layout
 
@@ -246,23 +246,23 @@ I/O scheduler: `none` (NVMe pass-through)
 
 ### Self-healing bootstrap
 
-Each new EC2 instance provisions itself automatically via `user_data`:
+Each new instance provisions itself automatically via cloud provider `user_data`:
 
 1. `scripts/setup_storage.sh` — partition NVMe, format ext4, mount, write `/etc/rocksqueue/env`
-2. `scripts/restore_from_s3.sh` — if `/data/rocksqueue` is empty, download latest S3 checkpoint
+2. `scripts/restore_from_s3.sh` — if `/data/rocksqueue` is empty, download latest checkpoint from object storage
 3. `scripts/validate_storage.sh` — pre-flight checks; abort if anything fails
 4. Install binary + systemd units
 5. `systemctl start rocksqueue`
-6. Poll `/ready` → complete ASG lifecycle hook
+6. Poll `/ready` → complete autoscaling lifecycle hook
 
 ### Checkpoints
 
 Systemd timer runs `scripts/checkpoint.sh` every 6 hours:
 1. `POST /admin/checkpoint` — RocksDB creates a hard-link snapshot
-2. `aws s3 sync` — upload to `s3://<bucket>/checkpoints/<timestamp>/`
+2. Sync to object storage — upload to `<bucket>/checkpoints/<timestamp>/`
 3. Keep the last 2 local checkpoints; delete older ones
 
-**Instance store warning:** stopping an EC2 instance wipes NVMe data. Rebooting preserves it. Maximum recovery gap is 6 hours (one checkpoint interval).
+**Instance store warning:** stopping an instance wipes local NVMe data. Rebooting preserves it. Maximum recovery gap is 6 hours (one checkpoint interval).
 
 Production environment variables are read from `/etc/rocksqueue/env` (written by `setup_storage.sh`) via systemd `EnvironmentFile`.
 
@@ -272,8 +272,8 @@ ROCKSDB_WAL_PATH=/wal/rocksqueue-wal
 CHECKPOINT_PATH=/data/checkpoints
 GRPC_ADDR=0.0.0.0:50051
 METRICS_ADDR=0.0.0.0:9090
-S3_BUCKET=<your-bucket>
-AWS_REGION=us-east-1
+OBJECT_STORE_BUCKET=<your-bucket>
+CLOUD_REGION=us-east-1
 RUST_LOG=rocksqueue=info
 ```
 
@@ -338,14 +338,29 @@ RUST_LOG=rocksqueue=info
 | `backlog_quota` | 100,000 | 1,000,000 |
 | `backlog_policy` | Reject | Block (5 s timeout) |
 
+## Design inspiration
+
+Several design decisions were informed by patterns observed in other related systems:
+
+- **Backlog quotas (implemented)** — other related systems enforce per-namespace backlog limits with configurable overflow policies (reject, block, or evict). RocksQueue implements all three via `NamespacePolicy`.
+- **Compaction-based TTL (implemented)** — rather than a dedicated GC thread, other related systems let the storage engine reclaim expired messages during normal compaction. RocksQueue registers compaction filters per CF for the same effect.
+- **Namespace layer (not yet implemented)** — other related systems support a namespace hierarchy below the tenant, each with independent quotas and retention. RocksQueue has the policy types in place but applies them at the tenant level only.
+- **Sticky consumer routing (not yet implemented)** — other related systems offer key-based routing that pins related messages to the same consumer, enabling ordered processing without global locking. The `OwnershipMap` module is a placeholder for this.
+- **Cursor-based acknowledgement (not yet implemented)** — other related systems track consumer position with a cursor rather than physically moving messages between storage locations on each ack. Eliminating the pending → inflight copy would halve write amplification on the hot path.
+- **Delayed delivery (not yet implemented)** — other related systems support a `deliver_at` timestamp, holding messages in a separate store until they are due. RocksQueue's `Task` struct has a `deadline` field but no delayed-delivery CF yet.
+
 ## Future work
 
-| Item | Description |
+| Item | Notes |
 |---|---|
-| Namespace layer | Sub-tenant policy granularity (Pulsar Lesson 2) |
-| Key_Shared routing | Sticky worker assignment for ordered processing (Lesson 5) |
-| Cursor-based ack | Eliminate physical CF moves on ack (Lesson 6) |
-| Delayed delivery | `deliver_at_ms` field + delayed CF (Lesson 9) |
-| Multi-node routing | Promote `OwnershipMap` from seed to active tenant routing |
-| Prometheus metrics | Wire actual counters to `/metrics` endpoint |
-| Criterion benchmarks | `benches/throughput.rs` — 1,000+ tasks/sec validation |
+| Namespace layer | Sub-tenant policy granularity; policy types already exist in `policy.rs` |
+| Sticky consumer routing | Key-based dispatch pinning related tasks to the same worker; `OwnershipMap` is the seed |
+| Cursor-based ack | Replace physical pending → inflight moves with a consumer cursor; halves write amplification |
+| Delayed delivery | `deliver_at_ms` on `Task` + a delayed CF; reaper promotes tasks when they come due |
+| Multi-node routing | Promote `OwnershipMap` from informational to active tenant-to-node routing |
+| Prometheus metrics | Wire `CompactionCounters` and scheduler stats to the `/metrics` endpoint |
+| Criterion benchmarks | `benches/throughput.rs` — validate 1,000+ tasks/sec under multi-tenant load |
+
+## License
+
+GNU General Public License v3.0 (GPL-3.0). See [LICENSE](LICENSE) for details.
