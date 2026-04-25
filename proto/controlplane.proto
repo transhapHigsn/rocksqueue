@@ -1,0 +1,231 @@
+syntax = "proto3";
+package controlplane;
+
+service ControlPlane {
+  // Tenant lifecycle
+  rpc ProvisionTenant      (ProvisionRequest)        returns (TenantResponse);
+  rpc DropTenant           (TenantId)                returns (TenantResponse);
+
+  // Scheduling policy
+  rpc UpdatePolicy         (PolicyRequest)           returns (TenantResponse);
+  rpc GetPolicy            (TenantId)                returns (PolicyResponse);
+
+  // Namespace policy (backlog quota + retention)
+  rpc SetNamespacePolicy   (NamespacePolicyRequest)  returns (TenantResponse);
+  rpc GetNamespacePolicy   (TenantId)                returns (NamespacePolicyResponse);
+
+  // Observability
+  rpc GetTenantStatus      (TenantId)                returns (TenantStatus);
+  rpc ListTenants          (Empty)                   returns (TenantList);
+  rpc WatchQueueDepth      (WatchRequest)            returns (stream QueueDepthEvent);
+
+  // Stats
+  rpc GetTenantStats       (TenantId)                returns (TenantStatsResponse);
+  rpc ListAllStats         (Empty)                   returns (TenantStatsList);
+  rpc WatchStats           (WatchRequest)            returns (stream TenantStatsEvent);
+
+  // Auto-throttle
+  rpc GetThrottleStatus    (TenantId)                returns (ThrottleStatus);
+  rpc ListThrottled        (Empty)                   returns (ThrottleList);
+  rpc ForceReleaseThrottle (TenantId)                returns (TenantResponse);
+
+  // Baseline drift
+  rpc GetBaselineStatus    (TenantId)                returns (BaselineStatus);
+  rpc ListAllBaselines     (Empty)                   returns (BaselineList);
+
+  // Operations
+  rpc PauseTenant          (TenantId)                returns (TenantResponse);
+  rpc ResumeTenant         (TenantId)                returns (TenantResponse);
+  rpc DrainTenant          (DrainRequest)            returns (DrainResponse);
+  rpc PurgeDLQ             (TenantId)                returns (PurgeResponse);
+  rpc ReplayDLQ            (TenantId)                returns (ReplayResponse);
+
+  // Compaction
+  rpc CompactTenant        (TenantId)                returns (CompactionResponse);
+  rpc GetCompactionStats   (TenantId)                returns (CompactionStats);
+}
+
+// ── Common ───────────────────────────────────────────────────────────────────
+
+message Empty {}
+
+message TenantId {
+  string tenant_id = 1;
+}
+
+message TenantResponse {
+  string tenant_id = 1;
+  bool   success   = 2;
+  string message   = 3;
+}
+
+// ── Provision ────────────────────────────────────────────────────────────────
+
+message ProvisionRequest {
+  string tenant_id = 1;
+  string tier      = 2;
+}
+
+// ── Policy ───────────────────────────────────────────────────────────────────
+
+message Policy {
+  uint32 weight        = 1;
+  uint32 max_inflight  = 2;
+  uint32 burst_tokens  = 3;
+  uint32 rate_per_sec  = 4;
+}
+
+message PolicyRequest {
+  string tenant_id = 1;
+  Policy policy    = 2;
+}
+
+message PolicyResponse {
+  string tenant_id = 1;
+  Policy policy    = 2;
+}
+
+// ── Namespace Policy ──────────────────────────────────────────────────────────
+
+message NamespacePolicyRequest {
+  string tenant_id              = 1;
+  uint64 backlog_quota          = 2;
+  string backlog_policy         = 3;
+  uint64 block_timeout_ms       = 4;
+  uint64 pending_retention_secs = 5;
+  uint64 dlq_retention_secs     = 6;
+  uint64 inflight_stale_secs    = 7;
+}
+
+message NamespacePolicyResponse {
+  string tenant_id              = 1;
+  uint64 backlog_quota          = 2;
+  string backlog_policy         = 3;
+  uint64 pending_retention_secs = 4;
+  uint64 dlq_retention_secs     = 5;
+  uint64 inflight_stale_secs    = 6;
+}
+
+// ── Status ───────────────────────────────────────────────────────────────────
+
+message TenantStatus {
+  string tenant_id = 1;
+  bool   paused    = 2;
+  uint64 pending   = 3;
+  uint64 inflight  = 4;
+  uint64 dlq       = 5;
+}
+
+message TenantList {
+  repeated string tenant_ids = 1;
+}
+
+// ── Watch ────────────────────────────────────────────────────────────────────
+
+message WatchRequest {
+  string tenant_id     = 1;
+  uint64 interval_secs = 2;
+}
+
+message QueueDepthEvent {
+  string tenant_id = 1;
+  string queue     = 2;
+  uint64 pending   = 3;
+  uint64 inflight  = 4;
+  uint64 dlq       = 5;
+  uint64 timestamp = 6;
+}
+
+// ── Stats ─────────────────────────────────────────────────────────────────────
+
+message TenantStatsResponse {
+  string tenant_id        = 1;
+  double arrival_rate     = 2;
+  double processing_rate  = 3;
+  double avg_task_latency = 4;
+  double burst_score      = 5;
+  double backlog_ratio    = 6;
+  uint64 total_enqueued   = 7;
+  uint64 total_acked      = 8;
+  uint64 total_nacked     = 9;
+  uint64 stats_version    = 10;
+  bool   is_new           = 11;
+}
+
+message TenantStatsList {
+  repeated TenantStatsResponse stats = 1;
+}
+
+message TenantStatsEvent {
+  TenantStatsResponse stats = 1;
+  uint64 timestamp          = 2;
+}
+
+// ── Throttle ──────────────────────────────────────────────────────────────────
+
+message ThrottleStatus {
+  string tenant_id         = 1;
+  bool   throttled         = 2;
+  string reason            = 3;
+  uint32 original_rate     = 4;
+  uint32 applied_rate      = 5;
+  uint64 triggered_at_ms   = 6;
+  uint64 cooldown_until_ms = 7;
+}
+
+message ThrottleList {
+  repeated ThrottleStatus throttled = 1;
+}
+
+// ── Baseline ──────────────────────────────────────────────────────────────────
+
+message BaselineStatus {
+  string tenant_id       = 1;
+  double short_ema       = 2;
+  double long_ema        = 3;
+  double rolling_peak    = 4;
+  double spike_threshold = 5;
+  uint64 last_updated_ms = 6;
+}
+
+message BaselineList {
+  repeated BaselineStatus baselines = 1;
+}
+
+// ── Operations ────────────────────────────────────────────────────────────────
+
+message DrainRequest {
+  string tenant_id    = 1;
+  uint64 timeout_secs = 2;
+}
+
+message DrainResponse {
+  string tenant_id = 1;
+  bool   drained   = 2;
+  uint64 remaining = 3;
+}
+
+message PurgeResponse {
+  string tenant_id = 1;
+  uint64 purged    = 2;
+}
+
+message ReplayResponse {
+  string tenant_id = 1;
+  uint64 replayed  = 2;
+}
+
+// ── Compaction ────────────────────────────────────────────────────────────────
+
+message CompactionResponse {
+  string tenant_id = 1;
+  bool   success   = 2;
+}
+
+message CompactionStats {
+  string tenant_id      = 1;
+  uint64 pending_expired = 2;
+  uint64 dlq_expired     = 3;
+  uint64 inflight_stale  = 4;
+  uint64 kept            = 5;
+}

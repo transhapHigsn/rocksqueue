@@ -1,0 +1,63 @@
+version: "3.9"
+
+services:
+  rocksqueue:
+    build: .
+    ports:
+      - "50051:50051"
+      - "9090:9090"
+    environment:
+      - ROCKSDB_PATH=/data/rocksqueue
+      - ROCKSDB_WAL_PATH=/wal/rocksqueue-wal
+      - CHECKPOINT_PATH=/data/checkpoints
+      - GRPC_ADDR=0.0.0.0:50051
+      - METRICS_ADDR=0.0.0.0:9090
+      - S3_BUCKET=rocksqueue-local
+      - S3_ENDPOINT=http://minio:9000
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
+      - AWS_REGION=us-east-1
+      - RUST_LOG=rocksqueue=info
+    volumes:
+      - rocksqueue-data:/data
+      - rocksqueue-wal:/wal
+    depends_on:
+      - minio
+      - prometheus
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    volumes:
+      - minio-data:/data
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+volumes:
+  rocksqueue-data:
+  rocksqueue-wal:
+  minio-data:
+  grafana-data:
