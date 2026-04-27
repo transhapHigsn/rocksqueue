@@ -16,6 +16,16 @@ METRICS_ADDR="${METRICS_ADDR:-0.0.0.0:9090}"
 HOST="http://127.0.0.1:${METRICS_ADDR##*:}"
 REGION="${CLOUD_REGION:-${AWS_REGION:-us-east-1}}"
 
+# Map provider-neutral env vars to AWS CLI equivalents
+export AWS_ACCESS_KEY_ID="${OBJECT_STORE_ACCESS_KEY:-${AWS_ACCESS_KEY_ID:-}}"
+export AWS_SECRET_ACCESS_KEY="${OBJECT_STORE_SECRET_KEY:-${AWS_SECRET_ACCESS_KEY:-}}"
+export AWS_REGION="$REGION"
+
+ENDPOINT_FLAG=""
+if [ -n "${S3_ENDPOINT:-}" ]; then
+  ENDPOINT_FLAG="--endpoint-url $S3_ENDPOINT"
+fi
+
 TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ)
 LOCAL_PATH="$CHECKPOINT_PATH/$TIMESTAMP"
 
@@ -32,7 +42,8 @@ echo "Checkpoint created locally — syncing to object storage"
 aws s3 sync "$LOCAL_PATH/" \
     "s3://$BUCKET/checkpoints/$TIMESTAMP/" \
     --region "$REGION" \
-    --storage-class STANDARD_IA
+    --storage-class STANDARD_IA \
+    ${ENDPOINT_FLAG:+$ENDPOINT_FLAG}
 # [/OBJECT STORAGE]
 
 echo "Sync complete: $BUCKET/checkpoints/$TIMESTAMP/"

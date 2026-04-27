@@ -1,6 +1,11 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::{routing::get, Router};
+use axum::extract::{Query, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::{routing::get, routing::post, Json, Router};
+use serde::{Deserialize, Serialize};
 use tonic::transport::Server;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -10,7 +15,7 @@ use rocksqueue::config::Config;
 use rocksqueue::grpc::control_plane::ControlPlaneService;
 use rocksqueue::grpc::proto::control_plane_server::ControlPlaneServer;
 use rocksqueue::reaper::spawn_reaper;
-use rocksqueue::scheduler::WFQScheduler;
+use rocksqueue::scheduler::{TenantPolicy, WFQScheduler};
 use rocksqueue::stats::StatsCollector;
 use rocksqueue::stats_daemon::spawn_stats_daemon;
 use rocksqueue::stats_store::StatsStore;
@@ -40,7 +45,7 @@ async fn main() -> anyhow::Result<()> {
         write_buffer_bytes: 64 * 1024 * 1024,
         max_write_buffers: 4,
     };
-    let registry = Arc::new(TenantRegistry::open(&db_cfg, vec![])?);
+    let registry = Arc::new(TenantRegistry::open(&db_cfg)?);
     info!("RocksDB opened at {}", db_cfg.sst_path);
 
     // 5-9. Wire components
@@ -56,8 +61,27 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // 10-11. Warm state from last run
-    collector.warm_from_store(&store);
     throttle.restore_from_store();
+
+    let restored_tenants = registry.list_tenants();
+    for tenant_id in &restored_tenants {
+        if let Some(policy) = registry.get_policy(tenant_id) {
+            scheduler.register(TenantPolicy {
+                tenant_id: tenant_id.clone(),
+                weight: policy.weight,
+                max_inflight: policy.max_inflight,
+                burst_tokens: policy.burst_tokens,
+                rate_per_sec: policy.rate_per_sec,
+            });
+            collector.register(tenant_id);
+            baselines.register(tenant_id, 0.0);
+        }
+    }
+    collector.warm_from_store(&store);
+    info!(
+        "Restored runtime state for {} tenant(s)",
+        restored_tenants.len()
+    );
 
     // Default queues watched by daemon and reaper
     let queues = vec!["default".to_string()];
@@ -77,29 +101,19 @@ async fn main() -> anyhow::Result<()> {
     spawn_reaper(Arc::clone(&registry), queues.clone(), 30);
 
     // 14. HTTP metrics + health server
-    let registry_http = Arc::clone(&registry);
     let metrics_addr = cfg.metrics_addr;
-    let checkpoint_path = cfg.checkpoint_path.clone();
+    let http_state = HttpState {
+        registry: Arc::clone(&registry),
+        checkpoint_path: cfg.checkpoint_path.clone(),
+    };
 
     tokio::spawn(async move {
         let app = Router::new()
             .route("/health", get(|| async { "ok" }))
-            .route(
-                "/ready",
-                get({
-                    let reg = Arc::clone(&registry_http);
-                    move || {
-                        let reg = Arc::clone(&reg);
-                        async move {
-                            match reg.ping() {
-                                Ok(()) => "ok",
-                                Err(_) => "error",
-                            }
-                        }
-                    }
-                }),
-            )
-            .route("/metrics", get(|| async { "# rocksqueue metrics\n" }));
+            .route("/ready", get(ready_handler))
+            .route("/metrics", get(|| async { "# rocksqueue metrics\n" }))
+            .route("/admin/checkpoint", post(checkpoint_handler))
+            .with_state(http_state);
 
         info!("HTTP server listening on {metrics_addr}");
         let listener = tokio::net::TcpListener::bind(metrics_addr).await.unwrap();
@@ -116,6 +130,9 @@ async fn main() -> anyhow::Result<()> {
         queues,
     );
     let grpc_svc = ControlPlaneServer::new(svc);
+    let reflection_svc = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(rocksqueue::grpc::proto::FILE_DESCRIPTOR_SET)
+        .build()?;
 
     // 17. Signal systemd (no-op locally)
     let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
@@ -124,6 +141,7 @@ async fn main() -> anyhow::Result<()> {
     info!("gRPC server listening on {}", cfg.grpc_addr);
     Server::builder()
         .add_service(grpc_svc)
+        .add_service(reflection_svc)
         .serve_with_shutdown(cfg.grpc_addr, shutdown_signal())
         .await?;
 
@@ -136,4 +154,65 @@ async fn shutdown_signal() {
         .await
         .expect("Failed to install CTRL+C handler");
     info!("Received SIGTERM/SIGINT — shutting down");
+}
+
+#[derive(Clone)]
+struct HttpState {
+    registry: Arc<rocksqueue::tenant::TenantRegistry>,
+    checkpoint_path: PathBuf,
+}
+
+async fn ready_handler(State(state): State<HttpState>) -> impl IntoResponse {
+    match state.registry.ping() {
+        Ok(()) => "ok",
+        Err(_) => "error",
+    }
+}
+
+#[derive(Deserialize)]
+struct CheckpointParams {
+    path: String,
+}
+
+#[derive(Serialize)]
+struct CheckpointResponse {
+    ok: bool,
+    path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+async fn checkpoint_handler(
+    State(state): State<HttpState>,
+    Query(params): Query<CheckpointParams>,
+) -> impl IntoResponse {
+    let requested = std::path::Path::new(&params.path);
+    match state
+        .registry
+        .create_checkpoint(requested, &state.checkpoint_path)
+    {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(CheckpointResponse {
+                ok: true,
+                path: params.path,
+                error: None,
+            }),
+        ),
+        Err(e) => {
+            let status = if e.to_string().contains("must") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (
+                status,
+                Json(CheckpointResponse {
+                    ok: false,
+                    path: params.path,
+                    error: Some(e.to_string()),
+                }),
+            )
+        }
+    }
 }

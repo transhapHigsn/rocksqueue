@@ -61,8 +61,53 @@ case "$cmd" in
     grpcurl -plaintext -d '{}' "$GRPC_ADDR" controlplane.ControlPlane/ListAllStats
     ;;
 
+  traffic)
+    TENANT="${TENANT:-acme}"
+    QUEUE="${QUEUE:-default}"
+    BATCH_SIZE="${BATCH_SIZE:-10}"
+    DEQUEUE_LIMIT="${DEQUEUE_LIMIT:-10}"
+    SLEEP_SECS="${SLEEP_SECS:-0.2}"
+    ITERATION=0
+
+    echo "Generating queue traffic for tenant=$TENANT queue=$QUEUE batch_size=$BATCH_SIZE dequeue_limit=$DEQUEUE_LIMIT"
+    echo "Press Ctrl-C to stop."
+
+    while true; do
+      ITERATION=$((ITERATION + 1))
+      payloads=""
+      for i in $(seq 1 "$BATCH_SIZE"); do
+        payload="dummy-${TENANT}-${ITERATION}-${i}"
+        if [[ -n "$payloads" ]]; then
+          payloads="${payloads},"
+        fi
+        payloads="${payloads}\"${payload}\""
+      done
+
+      grpcurl -plaintext \
+        -d "{\"tenant_id\":\"${TENANT}\",\"queue\":\"${QUEUE}\",\"payloads\":[${payloads}]}" \
+        "$GRPC_ADDR" controlplane.ControlPlane/EnqueueBatch >/dev/null
+
+      response=$(grpcurl -plaintext \
+        -d "{\"tenant_id\":\"${TENANT}\",\"queue\":\"${QUEUE}\",\"limit\":${DEQUEUE_LIMIT}}" \
+        "$GRPC_ADDR" controlplane.ControlPlane/DequeueTasks)
+
+      acked=$(printf '%s\n' "$response" | sed -n 's/.*"ackKey": "\([^"]*\)".*/\1/p' | wc -l | tr -d ' ')
+      printf '%s\n' "$response" | sed -n 's/.*"ackKey": "\([^"]*\)".*/\1/p' | while read -r ack_key; do
+        grpcurl -plaintext \
+          -d "{\"tenant_id\":\"${TENANT}\",\"ack_key\":\"${ack_key}\"}" \
+          "$GRPC_ADDR" controlplane.ControlPlane/AckTask >/dev/null
+      done
+
+      if (( ITERATION % 10 == 0 )); then
+        echo "iteration=$ITERATION enqueued=$BATCH_SIZE acked=$acked"
+      fi
+
+      sleep "$SLEEP_SECS"
+    done
+    ;;
+
   *)
-    echo "Usage: $0 {seed|reset|checkpoint|restore|status|stats}"
+    echo "Usage: $0 {seed|reset|checkpoint|restore|status|stats|traffic}"
     exit 1
     ;;
 esac

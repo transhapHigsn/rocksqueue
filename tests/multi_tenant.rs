@@ -1,4 +1,4 @@
-use rocksqueue::policy::NamespacePolicy;
+use rocksqueue::policy::{BacklogPolicy, NamespacePolicy};
 use rocksqueue::tenant::{DbConfig, TenantRegistry};
 use tempfile::TempDir;
 
@@ -10,7 +10,7 @@ fn make_registry(tmp: &TempDir) -> TenantRegistry {
         write_buffer_bytes: 4 * 1024 * 1024,
         max_write_buffers: 2,
     };
-    TenantRegistry::open(&cfg, vec![]).expect("failed to open registry")
+    TenantRegistry::open(&cfg).expect("failed to open registry")
 }
 
 #[test]
@@ -116,4 +116,90 @@ fn test_replay_dlq() {
     let (pending, _, dlq_after) = registry.depth("acme", "default").unwrap();
     assert_eq!(dlq_after, 0);
     assert_eq!(pending, 1);
+}
+
+#[test]
+fn test_restart_recovery() {
+    let tmp = TempDir::new().unwrap();
+    let cfg = DbConfig {
+        sst_path: tmp.path().join("sst").to_string_lossy().to_string(),
+        wal_path: tmp.path().join("wal").to_string_lossy().to_string(),
+        block_cache_bytes: 16 * 1024 * 1024,
+        write_buffer_bytes: 4 * 1024 * 1024,
+        max_write_buffers: 2,
+    };
+
+    // First run: provision tenant and enqueue tasks
+    {
+        let registry = TenantRegistry::open(&cfg).expect("first open");
+        let policy = NamespacePolicy::standard("acme");
+        registry.provision_tenant("acme", policy.clone()).unwrap();
+        registry
+            .enqueue("acme", "default", b"task1".to_vec(), &policy)
+            .unwrap();
+        registry
+            .enqueue("acme", "default", b"task2".to_vec(), &policy)
+            .unwrap();
+        registry
+            .enqueue("acme", "default", b"task3".to_vec(), &policy)
+            .unwrap();
+        // registry drops here — DB closes
+    }
+
+    // Second run: reopen and verify tenant and queue depth survived
+    {
+        let registry = TenantRegistry::open(&cfg).expect("second open after restart");
+
+        let tenants = registry.list_tenants();
+        assert!(tenants.contains(&"acme".to_string()), "tenant must survive restart");
+
+        let (pending, _, _) = registry.depth("acme", "default").unwrap();
+        assert_eq!(pending, 3, "all 3 pending tasks must survive restart");
+
+        let policy = registry.get_policy("acme").expect("policy must survive restart");
+        assert_eq!(policy.tenant_id, "acme");
+    }
+}
+
+#[test]
+fn test_namespace_policy_update_persisted() {
+    let tmp = TempDir::new().unwrap();
+    let cfg = DbConfig {
+        sst_path: tmp.path().join("sst").to_string_lossy().to_string(),
+        wal_path: tmp.path().join("wal").to_string_lossy().to_string(),
+        block_cache_bytes: 16 * 1024 * 1024,
+        write_buffer_bytes: 4 * 1024 * 1024,
+        max_write_buffers: 2,
+    };
+
+    {
+        let registry = TenantRegistry::open(&cfg).expect("first open");
+        let policy = NamespacePolicy::standard("acme");
+        registry.provision_tenant("acme", policy).unwrap();
+
+        // Update quota to a specific value
+        let mut updated = NamespacePolicy::standard("acme");
+        updated.backlog_quota = Some(42);
+        updated.backlog_policy = BacklogPolicy::EvictOldest;
+        registry.update_namespace_policy("acme", updated).unwrap();
+
+        // Readable immediately
+        let p = registry.get_policy("acme").unwrap();
+        assert_eq!(p.backlog_quota, Some(42));
+    }
+
+    // Verify it survives a restart
+    {
+        let registry = TenantRegistry::open(&cfg).expect("second open");
+        let p = registry.get_policy("acme").expect("policy must survive restart");
+        assert_eq!(p.backlog_quota, Some(42), "updated quota must persist across restarts");
+        assert!(matches!(p.backlog_policy, BacklogPolicy::EvictOldest));
+    }
+
+    // Updating a non-existent tenant returns an error
+    {
+        let registry = TenantRegistry::open(&cfg).expect("third open");
+        let result = registry.update_namespace_policy("ghost", NamespacePolicy::standard("ghost"));
+        assert!(result.is_err(), "updating unknown tenant must fail");
+    }
 }

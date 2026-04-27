@@ -1,5 +1,6 @@
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -67,10 +68,60 @@ pub struct TenantRegistry {
     counters: Arc<CompactionCounters>,
     /// tenant_id → NamespacePolicy
     policies: DashMap<String, NamespacePolicy>,
+    /// "{tenant}/{queue}" → per-queue mutex serializing quota check + enqueue write
+    queue_locks: DashMap<String, Arc<Mutex<()>>>,
 }
 
+const TENANT_META_PREFIX: &[u8] = b"tenant:";
+
 impl TenantRegistry {
-    pub fn open(cfg: &DbConfig, existing_tenants: Vec<(String, NamespacePolicy)>) -> Result<Self> {
+    /// Read all tenant policies persisted in __system__ CF without acquiring a long-lived handle.
+    /// Uses a temporary DB open that drops (and releases the lock) before the real open.
+    fn load_persisted_tenants(cfg: &DbConfig) -> Result<Vec<(String, NamespacePolicy)>> {
+        let all_cfs = match DB::list_cf(&Options::default(), &cfg.sst_path) {
+            Ok(cfs) => cfs,
+            Err(_) => return Ok(vec![]), // fresh DB path does not exist yet
+        };
+        if !all_cfs.iter().any(|cf| cf == CF_SYSTEM) {
+            return Ok(vec![]);
+        }
+
+        let mut pre_opts = Options::default();
+        pre_opts.create_if_missing(false);
+        pre_opts.create_missing_column_families(false);
+        pre_opts.set_wal_dir(&cfg.wal_path);
+
+        let cf_descs: Vec<ColumnFamilyDescriptor> = all_cfs
+            .iter()
+            .map(|name| ColumnFamilyDescriptor::new(name.as_str(), Options::default()))
+            .collect();
+
+        let db = DB::open_cf_descriptors(&pre_opts, &cfg.sst_path, cf_descs)?;
+        let system_cf = db
+            .cf_handle(CF_SYSTEM)
+            .ok_or_else(|| QueueError::ColumnFamilyMissing(CF_SYSTEM.to_string()))?;
+
+        let iter = db.iterator_cf(
+            &system_cf,
+            rocksdb::IteratorMode::From(TENANT_META_PREFIX, rocksdb::Direction::Forward),
+        );
+
+        let mut tenants = vec![];
+        for item in iter {
+            let (key, value) = item?;
+            if !key.starts_with(TENANT_META_PREFIX) {
+                break;
+            }
+            let tenant_id =
+                String::from_utf8_lossy(&key[TENANT_META_PREFIX.len()..]).into_owned();
+            let policy: NamespacePolicy = bincode::deserialize(&value)?;
+            tenants.push((tenant_id, policy));
+        }
+        Ok(tenants) // db drops here, releasing the file lock
+    }
+
+    pub fn open(cfg: &DbConfig) -> Result<Self> {
+        let existing_tenants = Self::load_persisted_tenants(cfg)?;
         let block_cache = Cache::new_lru_cache(cfg.block_cache_bytes);
         let counters = CompactionCounters::new();
 
@@ -154,6 +205,7 @@ impl TenantRegistry {
             max_write_buffers: cfg.max_write_buffers,
             counters,
             policies,
+            queue_locks: DashMap::new(),
         })
     }
 
@@ -258,6 +310,16 @@ impl TenantRegistry {
         self.db.create_cf(&cf_inflight(tenant), &inflight_opts)?;
         self.db.create_cf(&cf_dlq(tenant), &dlq_opts)?;
 
+        // Persist policy to __system__ so it survives restarts
+        let system_cf = self
+            .db
+            .cf_handle(CF_SYSTEM)
+            .ok_or_else(|| QueueError::ColumnFamilyMissing(CF_SYSTEM.to_string()))?;
+        let meta_key = [TENANT_META_PREFIX, tenant.as_bytes()].concat();
+        let meta_value = bincode::serialize(&policy)?;
+        self.db
+            .put_cf_opt(&system_cf, &meta_key, &meta_value, &Self::admin_write_opts())?;
+
         self.policies.insert(tenant.to_string(), policy);
         info!("Provisioned tenant: {tenant}");
         Ok(())
@@ -267,7 +329,19 @@ impl TenantRegistry {
         self.db.drop_cf(&cf_pending(tenant))?;
         self.db.drop_cf(&cf_inflight(tenant))?;
         self.db.drop_cf(&cf_dlq(tenant))?;
+
+        // Remove persisted metadata from __system__
+        let system_cf = self
+            .db
+            .cf_handle(CF_SYSTEM)
+            .ok_or_else(|| QueueError::ColumnFamilyMissing(CF_SYSTEM.to_string()))?;
+        let meta_key = [TENANT_META_PREFIX, tenant.as_bytes()].concat();
+        self.db
+            .delete_cf_opt(&system_cf, &meta_key, &Self::admin_write_opts())?;
+
         self.policies.remove(tenant);
+        // Remove any queue locks for this tenant
+        self.queue_locks.retain(|k, _| !k.starts_with(&format!("{tenant}/")));
         info!("Dropped tenant: {tenant}");
         Ok(())
     }
@@ -329,6 +403,13 @@ impl TenantRegistry {
         self.enqueue_batch_sync(tenant, queue, payloads, policy)
     }
 
+    fn queue_lock(&self, tenant: &str, queue: &str) -> Arc<Mutex<()>> {
+        self.queue_locks
+            .entry(format!("{tenant}/{queue}"))
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
     fn enqueue_batch_sync(
         &self,
         tenant: &str,
@@ -337,6 +418,12 @@ impl TenantRegistry {
         policy: &NamespacePolicy,
     ) -> Result<Vec<String>> {
         let incoming = payloads.len();
+
+        // Hold the per-queue lock across the entire quota-check + write to eliminate the
+        // TOCTOU window that lets concurrent producers both observe capacity and both write.
+        let lock = self.queue_lock(tenant, queue);
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+
         self.enforce_quota(tenant, queue, policy, incoming)?;
 
         let pending_cf = self.pending_cf(tenant)?;
@@ -658,6 +745,50 @@ impl TenantRegistry {
 
     pub fn get_policy(&self, tenant: &str) -> Option<NamespacePolicy> {
         self.policies.get(tenant).map(|p| p.clone())
+    }
+
+    /// Update quota/retention policy for an existing tenant (persisted immediately).
+    pub fn update_namespace_policy(&self, tenant: &str, policy: NamespacePolicy) -> Result<()> {
+        if !self.policies.contains_key(tenant) {
+            return Err(QueueError::QueueNotFound(format!(
+                "tenant not found: {tenant}"
+            )));
+        }
+        let system_cf = self
+            .db
+            .cf_handle(CF_SYSTEM)
+            .ok_or_else(|| QueueError::ColumnFamilyMissing(CF_SYSTEM.to_string()))?;
+        let meta_key = [TENANT_META_PREFIX, tenant.as_bytes()].concat();
+        let meta_value = bincode::serialize(&policy)?;
+        self.db
+            .put_cf_opt(&system_cf, &meta_key, &meta_value, &Self::admin_write_opts())?;
+        self.policies.insert(tenant.to_string(), policy);
+        Ok(())
+    }
+
+    /// Create a RocksDB hard-link checkpoint at `path`.
+    /// `allowed_base` is the configured checkpoint directory; `path` must be under it.
+    pub fn create_checkpoint(&self, path: &Path, allowed_base: &Path) -> Result<()> {
+        // Reject paths with parent-directory traversal components
+        if path
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+        {
+            return Err(QueueError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "checkpoint path must not contain '..'",
+            )));
+        }
+        if !path.starts_with(allowed_base) {
+            return Err(QueueError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "checkpoint path must be under configured checkpoint directory",
+            )));
+        }
+        let checkpoint = rocksdb::checkpoint::Checkpoint::new(&self.db)?;
+        checkpoint.create_checkpoint(path)?;
+        info!("Checkpoint created at {}", path.display());
+        Ok(())
     }
 
     pub fn compaction_counters(&self) -> &CompactionCounters {

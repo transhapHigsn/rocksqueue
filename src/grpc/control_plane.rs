@@ -8,6 +8,7 @@ use tonic::{Request, Response, Status};
 use tracing::info;
 
 use crate::baseline::BaselineRegistry;
+use crate::error::QueueError;
 use crate::grpc::proto::control_plane_server::ControlPlane;
 use crate::grpc::proto::*;
 use crate::policy::{BacklogPolicy, NamespacePolicy, RetentionPolicy};
@@ -51,6 +52,28 @@ fn not_found(msg: &str) -> Status {
 
 fn internal(msg: &str) -> Status {
     Status::internal(msg)
+}
+
+fn queue_error(err: QueueError) -> Status {
+    match err {
+        QueueError::ColumnFamilyMissing(_)
+        | QueueError::QueueNotFound(_)
+        | QueueError::TaskNotFound(_) => Status::not_found(err.to_string()),
+        QueueError::BacklogQuotaExceeded { .. } => Status::resource_exhausted(err.to_string()),
+        _ => Status::internal(err.to_string()),
+    }
+}
+
+fn queue_or_default(queue: String) -> String {
+    if queue.is_empty() {
+        "default".to_string()
+    } else {
+        queue
+    }
+}
+
+fn decode_ack_key(ack_key: &str) -> Result<Vec<u8>, Status> {
+    hex::decode(ack_key).map_err(|e| Status::invalid_argument(format!("invalid ack_key: {e}")))
 }
 
 #[tonic::async_trait]
@@ -117,7 +140,9 @@ impl ControlPlane for ControlPlaneService {
         request: Request<PolicyRequest>,
     ) -> Result<Response<TenantResponse>, Status> {
         let req = request.into_inner();
-        let policy = req.policy.ok_or_else(|| Status::invalid_argument("policy required"))?;
+        let policy = req
+            .policy
+            .ok_or_else(|| Status::invalid_argument("policy required"))?;
         self.scheduler.update_policy(TenantPolicy {
             tenant_id: req.tenant_id.clone(),
             weight: policy.weight,
@@ -195,10 +220,15 @@ impl ControlPlane for ControlPlaneService {
             },
         };
 
-        // Update the in-memory policy map
-        // (Full CF recreation would require drop+provision; this updates in-memory only)
-        // For production use, re-provision the tenant if retention changes.
-        _ = ns_policy; // stored implicitly via registry policy map in full impl
+        self.registry
+            .update_namespace_policy(&req.tenant_id, ns_policy)
+            .map_err(|e| {
+                if e.to_string().contains("tenant not found") {
+                    Status::not_found(e.to_string())
+                } else {
+                    Status::internal(e.to_string())
+                }
+            })?;
 
         Ok(Response::new(TenantResponse {
             tenant_id: req.tenant_id,
@@ -261,10 +291,7 @@ impl ControlPlane for ControlPlaneService {
         }))
     }
 
-    async fn list_tenants(
-        &self,
-        _request: Request<Empty>,
-    ) -> Result<Response<TenantList>, Status> {
+    async fn list_tenants(&self, _request: Request<Empty>) -> Result<Response<TenantList>, Status> {
         Ok(Response::new(TenantList {
             tenant_ids: self.registry.list_tenants(),
         }))
@@ -283,8 +310,7 @@ impl ControlPlane for ControlPlaneService {
         let interval_secs = req.interval_secs.max(1);
 
         tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(Duration::from_secs(interval_secs));
+            let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
             loop {
                 interval.tick().await;
                 for queue in &queues {
@@ -312,6 +338,135 @@ impl ControlPlane for ControlPlaneService {
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    // ── Queue workload ───────────────────────────────────────────────────────
+
+    async fn enqueue_task(
+        &self,
+        request: Request<EnqueueRequest>,
+    ) -> Result<Response<EnqueueResponse>, Status> {
+        let req = request.into_inner();
+        let queue = queue_or_default(req.queue);
+        let policy = self
+            .registry
+            .get_policy(&req.tenant_id)
+            .ok_or_else(|| not_found("tenant not found"))?;
+
+        let task_id = self
+            .registry
+            .enqueue(&req.tenant_id, &queue, req.payload.into_bytes(), &policy)
+            .map_err(queue_error)?;
+
+        self.collector.record_enqueue(&req.tenant_id, 1);
+
+        Ok(Response::new(EnqueueResponse {
+            tenant_id: req.tenant_id,
+            queue,
+            task_ids: vec![task_id],
+        }))
+    }
+
+    async fn enqueue_batch(
+        &self,
+        request: Request<EnqueueBatchRequest>,
+    ) -> Result<Response<EnqueueResponse>, Status> {
+        let req = request.into_inner();
+        if req.payloads.is_empty() {
+            return Err(Status::invalid_argument("payloads must not be empty"));
+        }
+
+        let queue = queue_or_default(req.queue);
+        let policy = self
+            .registry
+            .get_policy(&req.tenant_id)
+            .ok_or_else(|| not_found("tenant not found"))?;
+        let count = req.payloads.len() as u64;
+        let payloads = req.payloads.into_iter().map(String::into_bytes).collect();
+
+        let task_ids = self
+            .registry
+            .enqueue_batch(&req.tenant_id, &queue, payloads, &policy)
+            .await
+            .map_err(queue_error)?;
+
+        self.collector.record_enqueue(&req.tenant_id, count);
+
+        Ok(Response::new(EnqueueResponse {
+            tenant_id: req.tenant_id,
+            queue,
+            task_ids,
+        }))
+    }
+
+    async fn dequeue_tasks(
+        &self,
+        request: Request<DequeueRequest>,
+    ) -> Result<Response<DequeueResponse>, Status> {
+        let req = request.into_inner();
+        let queue = queue_or_default(req.queue);
+        let limit = req.limit.max(1) as usize;
+
+        let tasks = self
+            .registry
+            .dequeue(&req.tenant_id, &queue, limit)
+            .map_err(queue_error)?
+            .into_iter()
+            .map(|(key, task)| DequeuedTask {
+                ack_key: hex::encode(key),
+                task_id: task.id,
+                queue: task.queue,
+                payload: String::from_utf8_lossy(&task.payload).into_owned(),
+                enqueued_at: task.enqueued_at,
+                attempts: task.attempts,
+                deadline: task.deadline,
+            })
+            .collect();
+
+        Ok(Response::new(DequeueResponse {
+            tenant_id: req.tenant_id,
+            queue,
+            tasks,
+        }))
+    }
+
+    async fn ack_task(
+        &self,
+        request: Request<TaskAckRequest>,
+    ) -> Result<Response<TaskOpResponse>, Status> {
+        let req = request.into_inner();
+        let key = decode_ack_key(&req.ack_key)?;
+
+        self.registry
+            .ack(&req.tenant_id, &key)
+            .map_err(queue_error)?;
+        self.collector
+            .record_ack(&req.tenant_id, Duration::from_millis(0));
+
+        Ok(Response::new(TaskOpResponse {
+            tenant_id: req.tenant_id,
+            success: true,
+            message: "acked".to_string(),
+        }))
+    }
+
+    async fn nack_task(
+        &self,
+        request: Request<TaskAckRequest>,
+    ) -> Result<Response<TaskOpResponse>, Status> {
+        let req = request.into_inner();
+        let key = decode_ack_key(&req.ack_key)?;
+
+        self.registry
+            .nack(&req.tenant_id, &key)
+            .map_err(queue_error)?;
+        self.collector.record_nack(&req.tenant_id);
+
+        Ok(Response::new(TaskOpResponse {
+            tenant_id: req.tenant_id,
+            success: true,
+            message: "nacked".to_string(),
+        }))
     }
 
     // ── Stats ─────────────────────────────────────────────────────────────────
@@ -379,8 +534,7 @@ impl ControlPlane for ControlPlaneService {
         let interval_secs = req.interval_secs.max(1);
 
         tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(Duration::from_secs(interval_secs));
+            let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
             loop {
                 interval.tick().await;
                 if let Some(s) = collector.snapshot(&req.tenant_id) {

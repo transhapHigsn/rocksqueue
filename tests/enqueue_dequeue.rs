@@ -10,7 +10,7 @@ fn make_registry(tmp: &TempDir) -> TenantRegistry {
         write_buffer_bytes: 4 * 1024 * 1024,
         max_write_buffers: 2,
     };
-    TenantRegistry::open(&cfg, vec![]).expect("failed to open registry")
+    TenantRegistry::open(&cfg).expect("failed to open registry")
 }
 
 #[test]

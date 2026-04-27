@@ -98,29 +98,21 @@ pub fn make_dlq_filter(
 }
 
 /// Returns a compaction filter function for the inflight CF.
-/// Safety net: removes tasks overdue by more than `stale_after_secs`.
+/// Only removes corrupt (undeserializable) records — stale-but-valid inflight tasks
+/// are recovered by the reaper to preserve at-least-once delivery semantics.
 pub fn make_inflight_filter(
-    stale_after_secs: u64,
+    _stale_after_secs: u64,
     counters: Arc<CompactionCounters>,
 ) -> impl Fn(u32, &[u8], &[u8]) -> Decision {
-    move |_level, _key, value| {
-        match Task::deserialize(value) {
-            Ok(task) => {
-                if task.deadline > 0 {
-                    let now = now_millis();
-                    let overdue_ms = now.saturating_sub(task.deadline);
-                    if overdue_ms > stale_after_secs * 1000 {
-                        counters.inflight_stale.fetch_add(1, Ordering::Relaxed);
-                        return Decision::Remove;
-                    }
-                }
-                counters.kept.fetch_add(1, Ordering::Relaxed);
-                Decision::Keep
-            }
-            Err(_) => {
-                counters.inflight_stale.fetch_add(1, Ordering::Relaxed);
-                Decision::Remove
-            }
+    move |_level, _key, value| match Task::deserialize(value) {
+        Ok(_) => {
+            counters.kept.fetch_add(1, Ordering::Relaxed);
+            Decision::Keep
+        }
+        Err(_) => {
+            // Corrupt value — unrecoverable, safe to purge
+            counters.inflight_stale.fetch_add(1, Ordering::Relaxed);
+            Decision::Remove
         }
     }
 }

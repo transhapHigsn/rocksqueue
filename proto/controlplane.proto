@@ -19,6 +19,13 @@ service ControlPlane {
   rpc ListTenants          (Empty)                   returns (TenantList);
   rpc WatchQueueDepth      (WatchRequest)            returns (stream QueueDepthEvent);
 
+  // Queue workload
+  rpc EnqueueTask          (EnqueueRequest)          returns (EnqueueResponse);
+  rpc EnqueueBatch         (EnqueueBatchRequest)     returns (EnqueueResponse);
+  rpc DequeueTasks         (DequeueRequest)          returns (DequeueResponse);
+  rpc AckTask              (TaskAckRequest)          returns (TaskOpResponse);
+  rpc NackTask             (TaskAckRequest)          returns (TaskOpResponse);
+
   // Stats
   rpc GetTenantStats       (TenantId)                returns (TenantStatsResponse);
   rpc ListAllStats         (Empty)                   returns (TenantStatsList);
@@ -134,6 +141,59 @@ message QueueDepthEvent {
   uint64 inflight  = 4;
   uint64 dlq       = 5;
   uint64 timestamp = 6;
+}
+
+// ── Queue Workload ───────────────────────────────────────────────────────────
+
+message EnqueueRequest {
+  string tenant_id = 1;
+  string queue     = 2;
+  string payload   = 3;
+}
+
+message EnqueueBatchRequest {
+  string tenant_id        = 1;
+  string queue            = 2;
+  repeated string payloads = 3;
+}
+
+message EnqueueResponse {
+  string tenant_id        = 1;
+  string queue            = 2;
+  repeated string task_ids = 3;
+}
+
+message DequeueRequest {
+  string tenant_id = 1;
+  string queue     = 2;
+  uint32 limit     = 3;
+}
+
+message DequeuedTask {
+  string ack_key     = 1;
+  string task_id     = 2;
+  string queue       = 3;
+  string payload     = 4;
+  uint64 enqueued_at = 5;
+  uint32 attempts    = 6;
+  uint64 deadline    = 7;
+}
+
+message DequeueResponse {
+  string tenant_id          = 1;
+  string queue              = 2;
+  repeated DequeuedTask tasks = 3;
+}
+
+message TaskAckRequest {
+  string tenant_id = 1;
+  string ack_key   = 2;
+}
+
+message TaskOpResponse {
+  string tenant_id = 1;
+  bool   success   = 2;
+  string message   = 3;
 }
 
 // ── Stats ─────────────────────────────────────────────────────────────────────
