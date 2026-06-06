@@ -1,6 +1,6 @@
 # RocksQueue
 
-A production-grade, RocksDB-backed multi-tenant task queue written in Rust. Targets 1,000+ tasks/second with hard noisy-neighbour isolation, adaptive scheduling, and self-healing single-node deployment on any major cloud provider.
+A RocksDB-backed multi-tenant task queue written in Rust. Targets 1,000+ tasks/second with hard noisy-neighbour isolation, adaptive scheduling, and self-healing single-node deployment on any major cloud provider.
 
 ## Features
 
