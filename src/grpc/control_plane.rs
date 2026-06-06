@@ -78,6 +78,20 @@ fn decode_ack_key(ack_key: &str) -> Result<Vec<u8>, Status> {
     hex::decode(ack_key).map_err(|e| Status::invalid_argument(format!("invalid ack_key: {e}")))
 }
 
+/// Run a blocking RocksDB operation on the dedicated blocking pool so it never
+/// occupies a tonic executor thread. Join failures map to `internal`; the
+/// operation's own `QueueError` maps via `queue_error`.
+async fn offload<F, T>(f: F) -> Result<T, Status>
+where
+    F: FnOnce() -> crate::error::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| internal(&format!("blocking task failed: {e}")))?
+        .map_err(queue_error)
+}
+
 #[tonic::async_trait]
 impl ControlPlane for ControlPlaneService {
     // ── Tenant lifecycle ──────────────────────────────────────────────────────
@@ -100,9 +114,11 @@ impl ControlPlane for ControlPlaneService {
             rate_per_sec: policy.rate_per_sec,
         };
 
-        self.registry
-            .provision_tenant(&req.tenant_id, policy)
-            .map_err(|e| internal(&e.to_string()))?;
+        {
+            let registry = Arc::clone(&self.registry);
+            let tenant = req.tenant_id.clone();
+            offload(move || registry.provision_tenant(&tenant, policy)).await?;
+        }
 
         self.scheduler.register(sched_policy);
         self.collector.register(&req.tenant_id);
@@ -121,9 +137,11 @@ impl ControlPlane for ControlPlaneService {
         request: Request<TenantId>,
     ) -> Result<Response<TenantResponse>, Status> {
         let req = request.into_inner();
-        self.registry
-            .drop_tenant(&req.tenant_id)
-            .map_err(|e| internal(&e.to_string()))?;
+        {
+            let registry = Arc::clone(&self.registry);
+            let tenant = req.tenant_id.clone();
+            offload(move || registry.drop_tenant(&tenant)).await?;
+        }
         self.scheduler.deregister(&req.tenant_id);
         self.collector.deregister(&req.tenant_id);
         self.baselines.deregister(&req.tenant_id);
@@ -222,15 +240,11 @@ impl ControlPlane for ControlPlaneService {
             },
         };
 
-        self.registry
-            .update_namespace_policy(&req.tenant_id, ns_policy)
-            .map_err(|e| {
-                if e.to_string().contains("tenant not found") {
-                    Status::not_found(e.to_string())
-                } else {
-                    Status::internal(e.to_string())
-                }
-            })?;
+        {
+            let registry = Arc::clone(&self.registry);
+            let tenant = req.tenant_id.clone();
+            offload(move || registry.update_namespace_policy(&tenant, ns_policy)).await?;
+        }
 
         Ok(Response::new(TenantResponse {
             tenant_id: req.tenant_id,
@@ -273,10 +287,11 @@ impl ControlPlane for ControlPlaneService {
     ) -> Result<Response<TenantStatus>, Status> {
         let req = request.into_inner();
         let queue = self.queues.first().cloned().unwrap_or_default();
-        let (pending, inflight, dlq) = self
-            .registry
-            .depth(&req.tenant_id, &queue)
-            .map_err(|e| internal(&e.to_string()))?;
+        let (pending, inflight, dlq) = {
+            let registry = Arc::clone(&self.registry);
+            let tenant = req.tenant_id.clone();
+            offload(move || registry.depth(&tenant, &queue)).await?
+        };
 
         let paused = self
             .scheduler
@@ -316,7 +331,22 @@ impl ControlPlane for ControlPlaneService {
             loop {
                 interval.tick().await;
                 for queue in &queues {
-                    match registry.depth(&req.tenant_id, queue) {
+                    let depth = {
+                        let registry = Arc::clone(&registry);
+                        let tenant = req.tenant_id.clone();
+                        let queue = queue.clone();
+                        tokio::task::spawn_blocking(move || registry.depth(&tenant, &queue)).await
+                    };
+                    let depth = match depth {
+                        Ok(inner) => inner,
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(internal(&format!("blocking task failed: {e}"))))
+                                .await;
+                            return;
+                        }
+                    };
+                    match depth {
                         Ok((p, i, d)) => {
                             let event = Ok(QueueDepthEvent {
                                 tenant_id: req.tenant_id.clone(),
@@ -355,10 +385,13 @@ impl ControlPlane for ControlPlaneService {
             .get_policy(&req.tenant_id)
             .ok_or_else(|| not_found("tenant not found"))?;
 
-        let task_id = self
-            .registry
-            .enqueue(&req.tenant_id, &queue, req.payload.into_bytes(), &policy)
-            .map_err(queue_error)?;
+        let task_id = {
+            let registry = Arc::clone(&self.registry);
+            let tenant = req.tenant_id.clone();
+            let queue = queue.clone();
+            let payload = req.payload.into_bytes();
+            offload(move || registry.enqueue(&tenant, &queue, payload, &policy)).await?
+        };
 
         self.collector.record_enqueue(&req.tenant_id, 1);
 
@@ -384,13 +417,14 @@ impl ControlPlane for ControlPlaneService {
             .get_policy(&req.tenant_id)
             .ok_or_else(|| not_found("tenant not found"))?;
         let count = req.payloads.len() as u64;
-        let payloads = req.payloads.into_iter().map(String::into_bytes).collect();
+        let payloads: Vec<Vec<u8>> = req.payloads.into_iter().map(String::into_bytes).collect();
 
-        let task_ids = self
-            .registry
-            .enqueue_batch(&req.tenant_id, &queue, payloads, &policy)
-            .await
-            .map_err(queue_error)?;
+        let task_ids = {
+            let registry = Arc::clone(&self.registry);
+            let tenant = req.tenant_id.clone();
+            let queue = queue.clone();
+            offload(move || registry.enqueue_batch_sync(&tenant, &queue, payloads, &policy)).await?
+        };
 
         self.collector.record_enqueue(&req.tenant_id, count);
 
@@ -417,10 +451,18 @@ impl ControlPlane for ControlPlaneService {
             .get_policy(&req.tenant_id)
             .ok_or_else(|| not_found("tenant not found"))?;
 
-        let tasks = self
-            .registry
-            .dequeue_with_max_inflight(&req.tenant_id, &queue, limit, 60_000, policy.max_inflight)
-            .map_err(queue_error)?
+        let dequeued = {
+            let registry = Arc::clone(&self.registry);
+            let tenant = req.tenant_id.clone();
+            let queue = queue.clone();
+            let max_inflight = policy.max_inflight;
+            offload(move || {
+                registry.dequeue_with_max_inflight(&tenant, &queue, limit, 60_000, max_inflight)
+            })
+            .await?
+        };
+
+        let tasks = dequeued
             .into_iter()
             .map(|(key, task)| DequeuedTask {
                 ack_key: hex::encode(key),
@@ -447,11 +489,15 @@ impl ControlPlane for ControlPlaneService {
         let req = request.into_inner();
         let key = decode_ack_key(&req.ack_key)?;
 
-        self.registry
-            .ack(&req.tenant_id, &key)
-            .map_err(queue_error)?;
-        self.collector
-            .record_ack(&req.tenant_id, Duration::from_millis(0));
+        let acked = {
+            let registry = Arc::clone(&self.registry);
+            let tenant = req.tenant_id.clone();
+            offload(move || registry.ack(&tenant, &key)).await?
+        };
+        if acked {
+            self.collector
+                .record_ack(&req.tenant_id, Duration::from_millis(0));
+        }
 
         Ok(Response::new(TaskOpResponse {
             tenant_id: req.tenant_id,
@@ -475,10 +521,11 @@ impl ControlPlane for ControlPlaneService {
             .map(|ack_key| decode_ack_key(ack_key))
             .collect::<Result<_, _>>()?;
 
-        let count = self
-            .registry
-            .ack_batch(&req.tenant_id, keys.iter().map(Vec::as_slice))
-            .map_err(queue_error)?;
+        let count = {
+            let registry = Arc::clone(&self.registry);
+            let tenant = req.tenant_id.clone();
+            offload(move || registry.ack_batch(&tenant, keys.iter().map(Vec::as_slice))).await?
+        };
         self.collector
             .record_ack_count(&req.tenant_id, count as u64, Duration::from_millis(0));
 
@@ -496,9 +543,11 @@ impl ControlPlane for ControlPlaneService {
         let req = request.into_inner();
         let key = decode_ack_key(&req.ack_key)?;
 
-        self.registry
-            .nack(&req.tenant_id, &key)
-            .map_err(queue_error)?;
+        {
+            let registry = Arc::clone(&self.registry);
+            let tenant = req.tenant_id.clone();
+            offload(move || registry.nack(&tenant, &key)).await?;
+        }
         self.collector.record_nack(&req.tenant_id);
 
         Ok(Response::new(TaskOpResponse {
@@ -748,24 +797,25 @@ impl ControlPlane for ControlPlaneService {
         let queue = self.queues.first().cloned().unwrap_or_default();
 
         loop {
-            match self.registry.depth(&req.tenant_id, &queue) {
-                Ok((pending, inflight, _)) => {
-                    if pending == 0 && inflight == 0 {
-                        return Ok(Response::new(DrainResponse {
-                            tenant_id: req.tenant_id,
-                            drained: true,
-                            remaining: 0,
-                        }));
-                    }
-                    if std::time::Instant::now() >= deadline {
-                        return Ok(Response::new(DrainResponse {
-                            tenant_id: req.tenant_id,
-                            drained: false,
-                            remaining: (pending + inflight) as u64,
-                        }));
-                    }
-                }
-                Err(e) => return Err(internal(&e.to_string())),
+            let (pending, inflight, _) = {
+                let registry = Arc::clone(&self.registry);
+                let tenant = req.tenant_id.clone();
+                let queue = queue.clone();
+                offload(move || registry.depth(&tenant, &queue)).await?
+            };
+            if pending == 0 && inflight == 0 {
+                return Ok(Response::new(DrainResponse {
+                    tenant_id: req.tenant_id,
+                    drained: true,
+                    remaining: 0,
+                }));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(Response::new(DrainResponse {
+                    tenant_id: req.tenant_id,
+                    drained: false,
+                    remaining: (pending + inflight) as u64,
+                }));
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
@@ -776,10 +826,11 @@ impl ControlPlane for ControlPlaneService {
         request: Request<TenantId>,
     ) -> Result<Response<PurgeResponse>, Status> {
         let req = request.into_inner();
-        let purged = self
-            .registry
-            .purge_dlq(&req.tenant_id)
-            .map_err(|e| internal(&e.to_string()))?;
+        let purged = {
+            let registry = Arc::clone(&self.registry);
+            let tenant = req.tenant_id.clone();
+            offload(move || registry.purge_dlq(&tenant)).await?
+        };
 
         Ok(Response::new(PurgeResponse {
             tenant_id: req.tenant_id,
@@ -792,10 +843,11 @@ impl ControlPlane for ControlPlaneService {
         request: Request<TenantId>,
     ) -> Result<Response<ReplayResponse>, Status> {
         let req = request.into_inner();
-        let replayed = self
-            .registry
-            .replay_dlq(&req.tenant_id)
-            .map_err(|e| internal(&e.to_string()))?;
+        let replayed = {
+            let registry = Arc::clone(&self.registry);
+            let tenant = req.tenant_id.clone();
+            offload(move || registry.replay_dlq(&tenant)).await?
+        };
 
         Ok(Response::new(ReplayResponse {
             tenant_id: req.tenant_id,
@@ -810,9 +862,11 @@ impl ControlPlane for ControlPlaneService {
         request: Request<TenantId>,
     ) -> Result<Response<CompactionResponse>, Status> {
         let req = request.into_inner();
-        self.registry
-            .compact_tenant(&req.tenant_id)
-            .map_err(|e| internal(&e.to_string()))?;
+        {
+            let registry = Arc::clone(&self.registry);
+            let tenant = req.tenant_id.clone();
+            offload(move || registry.compact_tenant(&tenant)).await?;
+        }
 
         Ok(Response::new(CompactionResponse {
             tenant_id: req.tenant_id,

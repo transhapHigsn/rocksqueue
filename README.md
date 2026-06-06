@@ -242,10 +242,7 @@ It currently measures:
 - enqueue-only throughput across 128 B, 1 KB, and 16 KB payloads and batch sizes 10, 100, and 500
 - dequeue-only drain rate across the same payload and batch matrix
 - dequeue+batch-ack drain rate across the same payload and batch matrix
-- experimental lease-mode dequeue+ack across the same payload and batch matrix
 - mixed enqueue → dequeue → batch-ack throughput for 1 KB payloads and batch sizes 10, 100, and 500
-
-At benchmark startup, RocksQueue also prints a `write_amplification_proxy` block. This is a disk-byte proxy over the temp RocksDB SST and WAL directories, not a hardware write counter, but it makes pending-to-inflight write amplification visible in the benchmark output.
 
 Run benchmark jobs against a clean temp-backed DB. Quotas are disabled inside the benchmark so enqueue/dequeue hot paths are measured separately from backlog policy scans.
 

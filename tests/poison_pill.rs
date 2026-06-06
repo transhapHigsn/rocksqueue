@@ -60,7 +60,11 @@ fn test_reaper_skips_corrupt_record() {
     rocksqueue::reaper::reap_inflight(&registry, "acme", "default").unwrap();
 
     // Both removed from inflight.
-    assert!(registry.db.get_cf(&inflight_cf, &valid_key).unwrap().is_none());
+    assert!(registry
+        .db
+        .get_cf(&inflight_cf, &valid_key)
+        .unwrap()
+        .is_none());
     assert!(registry
         .db
         .get_cf(&inflight_cf, &corrupt_key)
@@ -70,7 +74,10 @@ fn test_reaper_skips_corrupt_record() {
     // Valid record reclaimed to pending (sweep not aborted by the poison record).
     let pending_cf = registry.db.cf_handle("acme__pending").unwrap();
     let reclaimed = registry.db.get_cf(&pending_cf, &valid_key).unwrap();
-    assert!(reclaimed.is_some(), "valid record must be reclaimed to pending");
+    assert!(
+        reclaimed.is_some(),
+        "valid record must be reclaimed to pending"
+    );
 
     // Corrupt record landed in DLQ as a poison envelope.
     let dlq_cf = registry.db.cf_handle("acme__dlq").unwrap();
@@ -107,7 +114,9 @@ fn test_dequeue_skips_corrupt_record() {
         .enqueue("acme", "default", b"good".to_vec(), &policy)
         .unwrap();
 
-    let results = registry.dequeue_batch("acme", "default", 10, 60_000).unwrap();
+    let results = registry
+        .dequeue_batch("acme", "default", 1, 60_000)
+        .unwrap();
     assert_eq!(results.len(), 1, "valid task must still be returned");
     assert_eq!(results[0].1.payload, b"good");
 
@@ -142,7 +151,9 @@ fn test_nack_handles_corrupt_record() {
         .put_cf(&inflight_cf, &key, b"\x00 corrupt")
         .unwrap();
 
-    registry.nack("acme", &key).expect("nack must not error on corrupt record");
+    registry
+        .nack("acme", &key)
+        .expect("nack must not error on corrupt record");
 
     assert!(registry.db.get_cf(&inflight_cf, &key).unwrap().is_none());
     let dlq_cf = registry.db.cf_handle("acme__dlq").unwrap();

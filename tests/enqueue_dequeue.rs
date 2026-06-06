@@ -1,3 +1,6 @@
+use std::collections::HashSet;
+use std::sync::{Arc, Barrier};
+
 use rocksqueue::policy::NamespacePolicy;
 use rocksqueue::task::decode_key_seq;
 use rocksqueue::tenant::{DbConfig, TenantRegistry};
@@ -80,6 +83,69 @@ fn test_ack_batch_removes_multiple_inflight_tasks() {
 }
 
 #[test]
+fn test_ack_batch_counts_only_distinct_existing_records() {
+    let tmp = TempDir::new().unwrap();
+    let registry = make_registry(&tmp);
+    let policy = NamespacePolicy::standard("acme");
+    registry.provision_tenant("acme", policy.clone()).unwrap();
+
+    for i in 0..2 {
+        registry
+            .enqueue("acme", "default", format!("task{i}").into_bytes(), &policy)
+            .unwrap();
+    }
+
+    let tasks = registry.dequeue("acme", "default", 2).unwrap();
+    let missing = rocksqueue::task::encode_key("default", 0);
+    let requested = [
+        tasks[0].0.as_slice(),
+        tasks[0].0.as_slice(),
+        tasks[1].0.as_slice(),
+        missing.as_slice(),
+    ];
+
+    assert_eq!(registry.ack_batch("acme", requested).unwrap(), 2);
+    assert_eq!(registry.ack_batch("acme", requested).unwrap(), 0);
+    assert!(!registry.ack("acme", &missing).unwrap());
+}
+
+#[test]
+fn test_concurrent_ack_counts_record_once() {
+    let tmp = TempDir::new().unwrap();
+    let registry = Arc::new(make_registry(&tmp));
+    let policy = NamespacePolicy::standard("acme");
+    registry.provision_tenant("acme", policy.clone()).unwrap();
+    registry
+        .enqueue("acme", "default", b"task".to_vec(), &policy)
+        .unwrap();
+    let key = registry.dequeue("acme", "default", 1).unwrap().remove(0).0;
+
+    let barrier = Arc::new(Barrier::new(3));
+    let handles: Vec<_> = (0..2)
+        .map(|_| {
+            let registry = Arc::clone(&registry);
+            let barrier = Arc::clone(&barrier);
+            let key = key.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                registry
+                    .ack_batch("acme", std::iter::once(key.as_slice()))
+                    .unwrap()
+            })
+        })
+        .collect();
+
+    barrier.wait();
+    let acked: usize = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .sum();
+
+    assert_eq!(acked, 1);
+    assert_eq!(registry.depth("acme", "default").unwrap().1, 0);
+}
+
+#[test]
 fn test_dequeue_batch_uses_custom_visibility_timeout() {
     let tmp = TempDir::new().unwrap();
     let registry = make_registry(&tmp);
@@ -126,35 +192,44 @@ fn test_dequeue_with_max_inflight_caps_delivery() {
 }
 
 #[test]
-fn test_experimental_lease_dequeue_ack_removes_pending_and_inflight() {
+fn test_concurrent_dequeue_respects_max_inflight() {
     let tmp = TempDir::new().unwrap();
-    let registry = make_registry(&tmp);
+    let registry = Arc::new(make_registry(&tmp));
     let policy = NamespacePolicy::standard("acme");
     registry.provision_tenant("acme", policy.clone()).unwrap();
 
-    for i in 0..5 {
+    for i in 0..20 {
         registry
             .enqueue("acme", "default", format!("task{i}").into_bytes(), &policy)
             .unwrap();
     }
 
-    let tasks = registry
-        .dequeue_lease_batch_experimental("acme", "default", 5, 60_000)
-        .unwrap();
-    let keys: Vec<Vec<u8>> = tasks.into_iter().map(|(key, _)| key).collect();
+    let barrier = Arc::new(Barrier::new(3));
+    let handles: Vec<_> = (0..2)
+        .map(|_| {
+            let registry = Arc::clone(&registry);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                registry
+                    .dequeue_with_max_inflight("acme", "default", 10, 60_000, 3)
+                    .unwrap()
+            })
+        })
+        .collect();
 
-    let (pending_before_ack, inflight_before_ack, _) = registry.depth("acme", "default").unwrap();
-    assert_eq!(pending_before_ack, 5);
-    assert_eq!(inflight_before_ack, 5);
+    barrier.wait();
+    let delivered: Vec<_> = handles
+        .into_iter()
+        .flat_map(|handle| handle.join().unwrap())
+        .collect();
+    let unique_keys: HashSet<_> = delivered.iter().map(|(key, _)| key.clone()).collect();
 
-    let acked = registry
-        .ack_lease_batch_experimental("acme", keys.iter().map(Vec::as_slice))
-        .unwrap();
-
-    assert_eq!(acked, 5);
+    assert_eq!(delivered.len(), 3);
+    assert_eq!(unique_keys.len(), 3);
     let (pending, inflight, _) = registry.depth("acme", "default").unwrap();
-    assert_eq!(pending, 0);
-    assert_eq!(inflight, 0);
+    assert_eq!(pending, 17);
+    assert_eq!(inflight, 3);
 }
 
 #[test]

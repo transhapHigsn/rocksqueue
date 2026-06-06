@@ -1,8 +1,6 @@
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use rocksdb::WriteOptions;
-use tracing::warn;
 
 use crate::stats_store::StatsStore;
 

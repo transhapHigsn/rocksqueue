@@ -5,7 +5,7 @@ use dashmap::DashMap;
 use tracing::{info, warn};
 
 use crate::baseline::BaselineRegistry;
-use crate::scheduler::{TenantPolicy, WFQScheduler};
+use crate::scheduler::WFQScheduler;
 use crate::stats::TenantStats;
 use crate::stats_store::{PersistedThrottle, StatsStore};
 

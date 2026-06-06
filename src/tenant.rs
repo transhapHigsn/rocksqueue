@@ -69,8 +69,10 @@ pub struct TenantRegistry {
     counters: Arc<CompactionCounters>,
     /// tenant_id → NamespacePolicy
     policies: DashMap<String, NamespacePolicy>,
-    /// "{tenant}/{queue}" → per-queue mutex serializing quota check + enqueue write
+    /// "{tenant}/{queue}" → per-queue mutex serializing queue transitions.
     queue_locks: DashMap<String, Arc<Mutex<()>>>,
+    /// Separate mutexes keep concurrent acknowledgments idempotent without blocking quota release.
+    ack_locks: DashMap<String, Arc<Mutex<()>>>,
 }
 
 const TENANT_META_PREFIX: &[u8] = b"tenant:";
@@ -224,6 +226,7 @@ impl TenantRegistry {
             counters,
             policies,
             queue_locks: DashMap::new(),
+            ack_locks: DashMap::new(),
         })
     }
 
@@ -368,6 +371,8 @@ impl TenantRegistry {
         // Remove any queue locks for this tenant
         self.queue_locks
             .retain(|k, _| !k.starts_with(&format!("{tenant}/")));
+        self.ack_locks
+            .retain(|k, _| !k.starts_with(&format!("{tenant}/")));
         info!("Dropped tenant: {tenant}");
         Ok(())
     }
@@ -436,7 +441,14 @@ impl TenantRegistry {
             .clone()
     }
 
-    fn enqueue_batch_sync(
+    fn ack_lock(&self, tenant: &str, queue: &str) -> Arc<Mutex<()>> {
+        self.ack_locks
+            .entry(format!("{tenant}/{queue}"))
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    pub(crate) fn enqueue_batch_sync(
         &self,
         tenant: &str,
         queue: &str,
@@ -522,6 +534,12 @@ impl TenantRegistry {
                             incoming,
                         });
                     }
+                    // Blocking sleep is intentional: the enqueue hot path runs on a
+                    // tokio spawn_blocking thread (see the gRPC layer), not a tokio
+                    // worker, so this parks a dedicated blocking-pool thread rather
+                    // than starving the executor. Do not change to tokio::time::sleep
+                    // (that would require this path to be async). A condvar/async wait
+                    // is deferred until durable counters (P1).
                     std::thread::sleep(Duration::from_millis(50));
                 }
             }
@@ -573,6 +591,18 @@ impl TenantRegistry {
         limit: usize,
         visibility_timeout_ms: u64,
     ) -> Result<Vec<(Vec<u8>, Task)>> {
+        let lock = self.queue_lock(tenant, queue);
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.dequeue_batch_unlocked(tenant, queue, limit, visibility_timeout_ms)
+    }
+
+    fn dequeue_batch_unlocked(
+        &self,
+        tenant: &str,
+        queue: &str,
+        limit: usize,
+        visibility_timeout_ms: u64,
+    ) -> Result<Vec<(Vec<u8>, Task)>> {
         if limit == 0 {
             return Ok(vec![]);
         }
@@ -592,7 +622,7 @@ impl TenantRegistry {
         let mut poisoned = 0usize;
         let deadline = now_millis().saturating_add(visibility_timeout_ms);
 
-        for item in iter.take(limit) {
+        for item in iter {
             let (key, value) = item?;
             let mut task = match Task::deserialize(&value) {
                 Ok(task) => task,
@@ -611,6 +641,10 @@ impl TenantRegistry {
             batch.delete_cf(&pending_cf, &key);
             batch.put_cf(&inflight_cf, &key, &updated_value);
             results.push((key.to_vec(), task));
+
+            if results.len() >= limit {
+                break;
+            }
         }
 
         if !results.is_empty() || poisoned > 0 {
@@ -631,12 +665,15 @@ impl TenantRegistry {
             return Ok(vec![]);
         }
 
+        let lock = self.queue_lock(tenant, queue);
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+
         let inflight = self.count_prefix(self.inflight_cf(tenant)?, queue)?;
         if inflight >= max_inflight {
             return Ok(vec![]);
         }
 
-        self.dequeue_batch(
+        self.dequeue_batch_unlocked(
             tenant,
             queue,
             limit.min(max_inflight - inflight),
@@ -644,60 +681,8 @@ impl TenantRegistry {
         )
     }
 
-    pub fn dequeue_lease_batch_experimental(
-        &self,
-        tenant: &str,
-        queue: &str,
-        limit: usize,
-        visibility_timeout_ms: u64,
-    ) -> Result<Vec<(Vec<u8>, Task)>> {
-        if limit == 0 {
-            return Ok(vec![]);
-        }
-
-        let pending_cf = self.pending_cf(tenant)?;
-        let inflight_cf = self.inflight_cf(tenant)?;
-        let prefix = queue_prefix(queue);
-        let iter = self.db.iterator_cf_opt(
-            &pending_cf,
-            Self::queue_read_opts(&prefix),
-            rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward),
-        );
-
-        let mut results = Vec::with_capacity(limit);
-        let mut batch = WriteBatch::default();
-        let deadline = now_millis().saturating_add(visibility_timeout_ms);
-
-        for item in iter {
-            let (key, value) = item?;
-            if self.db.get_cf(&inflight_cf, &key)?.is_some() {
-                continue;
-            }
-
-            let mut task = Task::deserialize(&value)?;
-            task.attempts += 1;
-            task.deadline = deadline;
-
-            let mut lease_value = Vec::with_capacity(12);
-            lease_value.extend_from_slice(&task.attempts.to_be_bytes());
-            lease_value.extend_from_slice(&deadline.to_be_bytes());
-            batch.put_cf(&inflight_cf, &key, &lease_value);
-            results.push((key.to_vec(), task));
-
-            if results.len() >= limit {
-                break;
-            }
-        }
-
-        if !results.is_empty() {
-            self.db.write_opt(batch, &Self::hot_write_opts())?;
-        }
-        Ok(results)
-    }
-
-    pub fn ack(&self, tenant: &str, key: &[u8]) -> Result<()> {
-        self.ack_batch(tenant, std::iter::once(key))?;
-        Ok(())
+    pub fn ack(&self, tenant: &str, key: &[u8]) -> Result<bool> {
+        Ok(self.ack_batch(tenant, std::iter::once(key))? == 1)
     }
 
     pub fn ack_batch<'a, I>(&self, tenant: &str, keys: I) -> Result<usize>
@@ -705,33 +690,35 @@ impl TenantRegistry {
         I: IntoIterator<Item = &'a [u8]>,
     {
         let inflight_cf = self.inflight_cf(tenant)?;
+        let keys: Vec<Vec<u8>> = keys.into_iter().map(ToOwned::to_owned).collect();
+        let mut queues: Vec<String> = keys
+            .iter()
+            .map(|key| {
+                let end = key.iter().position(|b| *b == 0x00).unwrap_or(key.len());
+                String::from_utf8_lossy(&key[..end]).into_owned()
+            })
+            .collect();
+        queues.sort();
+        queues.dedup();
+
+        let locks: Vec<_> = queues
+            .iter()
+            .map(|queue| self.ack_lock(tenant, queue))
+            .collect();
+        let _guards: Vec<_> = locks
+            .iter()
+            .map(|lock| lock.lock().unwrap_or_else(|e| e.into_inner()))
+            .collect();
+
         let mut batch = WriteBatch::default();
         let mut count = 0usize;
+        let mut seen = std::collections::HashSet::new();
 
-        for key in keys {
-            batch.delete_cf(&inflight_cf, key);
-            count += 1;
-        }
-
-        if count > 0 {
-            self.db.write_opt(batch, &Self::hot_write_opts())?;
-        }
-        Ok(count)
-    }
-
-    pub fn ack_lease_batch_experimental<'a, I>(&self, tenant: &str, keys: I) -> Result<usize>
-    where
-        I: IntoIterator<Item = &'a [u8]>,
-    {
-        let pending_cf = self.pending_cf(tenant)?;
-        let inflight_cf = self.inflight_cf(tenant)?;
-        let mut batch = WriteBatch::default();
-        let mut count = 0usize;
-
-        for key in keys {
-            batch.delete_cf(&pending_cf, key);
-            batch.delete_cf(&inflight_cf, key);
-            count += 1;
+        for key in &keys {
+            if seen.insert(key.clone()) && self.db.get_cf(&inflight_cf, key)?.is_some() {
+                batch.delete_cf(&inflight_cf, key);
+                count += 1;
+            }
         }
 
         if count > 0 {
