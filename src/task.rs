@@ -25,6 +25,22 @@ impl Task {
     pub fn age_ms(&self) -> u64 {
         now_millis().saturating_sub(self.enqueued_at)
     }
+
+    /// Wrap unparseable bytes in a valid `Task` envelope so a corrupt record can
+    /// be routed to the DLQ for inspection without re-poisoning it (the DLQ
+    /// compaction filter also calls `deserialize`). `attempts` is maxed so it is
+    /// never retried back onto a live queue.
+    pub fn poison(queue: &str, raw: &[u8]) -> Self {
+        let now = now_millis();
+        Task {
+            id: format!("corrupt-{now}"),
+            queue: queue.to_string(),
+            payload: raw.to_vec(),
+            enqueued_at: now,
+            attempts: u32::MAX,
+            deadline: 0,
+        }
+    }
 }
 
 /// Encode a RocksDB key for a task: `{queue_bytes}\x00{seq_be_8bytes}`
@@ -40,6 +56,11 @@ pub fn queue_prefix(queue: &str) -> Vec<u8> {
     let mut prefix = queue.as_bytes().to_vec();
     prefix.push(0x00);
     prefix
+}
+
+pub fn decode_key_seq(key: &[u8]) -> Option<u64> {
+    let seq_bytes: [u8; 8] = key.get(key.len().checked_sub(8)?..)?.try_into().ok()?;
+    Some(u64::from_be_bytes(seq_bytes))
 }
 
 pub fn now_millis() -> u64 {

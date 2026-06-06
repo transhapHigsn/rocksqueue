@@ -228,6 +228,29 @@ grpcurl -plaintext -d '{"tenant_id":"acme"}' \
 ./scripts/dev.sh stats       # ListAllStats
 ```
 
+## Throughput benchmarks
+
+The benchmark suite isolates library-level storage throughput from gRPC/protobuf overhead:
+
+```bash
+cargo bench --bench throughput
+```
+
+Criterion writes reports and plots under `target/criterion/`. RocksQueue forces Criterion to use the Rust `plotters` backend, so GNUplot is not required and is not used by default. Benchmark groups use flat sampling with 30 samples, a 20 s measurement window, and a 5 s warm-up to keep long-running storage operations from being skewed by Criterion's linear iteration scaling.
+
+It currently measures:
+- enqueue-only throughput across 128 B, 1 KB, and 16 KB payloads and batch sizes 10, 100, and 500
+- dequeue-only drain rate across the same payload and batch matrix
+- dequeue+batch-ack drain rate across the same payload and batch matrix
+- experimental lease-mode dequeue+ack across the same payload and batch matrix
+- mixed enqueue → dequeue → batch-ack throughput for 1 KB payloads and batch sizes 10, 100, and 500
+
+At benchmark startup, RocksQueue also prints a `write_amplification_proxy` block. This is a disk-byte proxy over the temp RocksDB SST and WAL directories, not a hardware write counter, but it makes pending-to-inflight write amplification visible in the benchmark output.
+
+Run benchmark jobs against a clean temp-backed DB. Quotas are disabled inside the benchmark so enqueue/dequeue hot paths are measured separately from backlog policy scans.
+
+For production consumers, prefer dequeue limits of at least 100 and use 500 when draining backlog. A gRPC `DequeueTasks` request with `limit=0` uses the server default of 500.
+
 ## Production deployment
 
 ### Recommended instance
@@ -326,7 +349,7 @@ RUST_LOG=rocksqueue=info
 | `policy` | Backlog and retention policy types |
 | `config` | `Config::from_env()` — loads `.env` + env vars |
 | `ownership` | Single-node ownership map (seed for future multi-node routing) |
-| `grpc` | All 30 gRPC RPC handlers |
+| `grpc` | gRPC RPC handlers |
 
 ## Tenant tiers
 
@@ -346,6 +369,8 @@ Several design decisions were informed by patterns observed in other related sys
 - **Compaction-based TTL (implemented)** — rather than a dedicated GC thread, other related systems let the storage engine reclaim expired messages during normal compaction. RocksQueue registers compaction filters per CF for the same effect.
 - **Namespace layer (not yet implemented)** — other related systems support a namespace hierarchy below the tenant, each with independent quotas and retention. RocksQueue has the policy types in place but applies them at the tenant level only.
 - **Sticky consumer routing (not yet implemented)** — other related systems offer key-based routing that pins related messages to the same consumer, enabling ordered processing without global locking. The `OwnershipMap` module is a placeholder for this.
+- **Batch acknowledgement (implemented)** — consumers can acknowledge many delivered tasks with one write batch, similar to multi-ack / ack-all strategies in related queues.
+- **Bounded prefix scans (implemented)** — pending, inflight, and DLQ scans use queue-prefix bounds plus RocksDB prefix extraction to avoid scanning outside the target queue.
 - **Cursor-based acknowledgement (not yet implemented)** — other related systems track consumer position with a cursor rather than physically moving messages between storage locations on each ack. Eliminating the pending → inflight copy would halve write amplification on the hot path.
 - **Delayed delivery (not yet implemented)** — other related systems support a `deliver_at` timestamp, holding messages in a separate store until they are due. RocksQueue's `Task` struct has a `deadline` field but no delayed-delivery CF yet.
 
@@ -359,7 +384,7 @@ Several design decisions were informed by patterns observed in other related sys
 | Delayed delivery | `deliver_at_ms` on `Task` + a delayed CF; reaper promotes tasks when they come due |
 | Multi-node routing | Promote `OwnershipMap` from informational to active tenant-to-node routing |
 | Prometheus metrics | Wire `CompactionCounters` and scheduler stats to the `/metrics` endpoint |
-| Criterion benchmarks | `benches/throughput.rs` — validate 1,000+ tasks/sec under multi-tenant load |
+| gRPC throughput benchmarks | Extend `benches/throughput.rs` with client/server measurements to isolate network and protobuf overhead |
 
 ## License
 

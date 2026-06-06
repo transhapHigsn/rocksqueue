@@ -70,5 +70,8 @@ fn test_checkpoint_outside_base_rejected() {
     // Absolute path outside allowed base must be rejected
     let outside_path = tmp.path().join("elsewhere").join("snap");
     let result = registry.create_checkpoint(&outside_path, &checkpoint_base);
-    assert!(result.is_err(), "path outside allowed base must be rejected");
+    assert!(
+        result.is_err(),
+        "path outside allowed base must be rejected"
+    );
 }

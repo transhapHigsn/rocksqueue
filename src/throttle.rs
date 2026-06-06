@@ -113,9 +113,7 @@ impl AutoThrottle {
 
         for stats in all_stats {
             let tenant_id = &stats.tenant_id;
-            let is_spike = self
-                .baselines
-                .is_spike(tenant_id, stats.arrival_rate);
+            let is_spike = self.baselines.is_spike(tenant_id, stats.arrival_rate);
 
             let should_throttle = stats.burst_score > self.config.burst_threshold
                 || stats.backlog_ratio > self.config.backlog_threshold
@@ -125,16 +123,13 @@ impl AutoThrottle {
                 if existing.throttled {
                     // Check release conditions
                     let cooldown_done = now >= existing.cooldown_until_ms;
-                    let burst_ok = stats.burst_score
-                        < self.config.burst_threshold * 0.5;
-                    let backlog_ok = stats.backlog_ratio
-                        < self.config.backlog_threshold * 0.7;
+                    let burst_ok = stats.burst_score < self.config.burst_threshold * 0.5;
+                    let backlog_ok = stats.backlog_ratio < self.config.backlog_threshold * 0.7;
                     let spike_threshold = self
                         .baselines
                         .spike_threshold(tenant_id)
                         .unwrap_or(f64::MAX);
-                    let rate_ok =
-                        stats.arrival_rate < spike_threshold * 0.7;
+                    let rate_ok = stats.arrival_rate < spike_threshold * 0.7;
 
                     if cooldown_done && burst_ok && backlog_ok && rate_ok {
                         self.release_throttle(tenant_id, existing.original_rate);

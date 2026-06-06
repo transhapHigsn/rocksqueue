@@ -21,7 +21,9 @@ fn test_tenant_isolation() {
     let policy_a = NamespacePolicy::standard("acme");
     let policy_b = NamespacePolicy::standard("globex");
     registry.provision_tenant("acme", policy_a.clone()).unwrap();
-    registry.provision_tenant("globex", policy_b.clone()).unwrap();
+    registry
+        .provision_tenant("globex", policy_b.clone())
+        .unwrap();
 
     registry
         .enqueue("acme", "default", b"acme_task".to_vec(), &policy_a)
@@ -151,12 +153,17 @@ fn test_restart_recovery() {
         let registry = TenantRegistry::open(&cfg).expect("second open after restart");
 
         let tenants = registry.list_tenants();
-        assert!(tenants.contains(&"acme".to_string()), "tenant must survive restart");
+        assert!(
+            tenants.contains(&"acme".to_string()),
+            "tenant must survive restart"
+        );
 
         let (pending, _, _) = registry.depth("acme", "default").unwrap();
         assert_eq!(pending, 3, "all 3 pending tasks must survive restart");
 
-        let policy = registry.get_policy("acme").expect("policy must survive restart");
+        let policy = registry
+            .get_policy("acme")
+            .expect("policy must survive restart");
         assert_eq!(policy.tenant_id, "acme");
     }
 }
@@ -191,8 +198,14 @@ fn test_namespace_policy_update_persisted() {
     // Verify it survives a restart
     {
         let registry = TenantRegistry::open(&cfg).expect("second open");
-        let p = registry.get_policy("acme").expect("policy must survive restart");
-        assert_eq!(p.backlog_quota, Some(42), "updated quota must persist across restarts");
+        let p = registry
+            .get_policy("acme")
+            .expect("policy must survive restart");
+        assert_eq!(
+            p.backlog_quota,
+            Some(42),
+            "updated quota must persist across restarts"
+        );
         assert!(matches!(p.backlog_policy, BacklogPolicy::EvictOldest));
     }
 
@@ -201,5 +214,39 @@ fn test_namespace_policy_update_persisted() {
         let registry = TenantRegistry::open(&cfg).expect("third open");
         let result = registry.update_namespace_policy("ghost", NamespacePolicy::standard("ghost"));
         assert!(result.is_err(), "updating unknown tenant must fail");
+    }
+}
+
+/// S2 regression: tenants provisioned at runtime must share the registry's
+/// block cache (block_cache_bytes), not get an isolated per-tenant cache sized
+/// at write_buffer_bytes. We assert the RocksDB block-cache-capacity reported by
+/// a provisioned tenant's CFs equals the shared cache size. Before the fix this
+/// reported write_buffer_bytes (4 MiB) instead of block_cache_bytes (16 MiB).
+#[test]
+fn test_provisioned_tenant_shares_block_cache() {
+    let tmp = TempDir::new().unwrap();
+    let registry = make_registry(&tmp); // 16 MiB cache, 4 MiB write buffer
+    const SHARED_CACHE_BYTES: u64 = 16 * 1024 * 1024;
+    const WRITE_BUFFER_BYTES: u64 = 4 * 1024 * 1024;
+
+    registry
+        .provision_tenant("acme", NamespacePolicy::standard("acme"))
+        .unwrap();
+
+    for cf_name in ["acme__pending", "acme__inflight", "acme__dlq"] {
+        let cf = registry.db.cf_handle(cf_name).expect("cf must exist");
+        let cap = registry
+            .db
+            .property_int_value_cf(&cf, "rocksdb.block-cache-capacity")
+            .expect("property read ok")
+            .expect("capacity present");
+        assert_eq!(
+            cap, SHARED_CACHE_BYTES,
+            "{cf_name} must use the shared block cache, got {cap} bytes"
+        );
+        assert_ne!(
+            cap, WRITE_BUFFER_BYTES,
+            "{cf_name} must not use an isolated per-tenant cache"
+        );
     }
 }

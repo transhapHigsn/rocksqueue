@@ -8,11 +8,7 @@ use tracing::{debug, warn};
 use crate::task::{now_millis, queue_prefix, Task};
 use crate::tenant::TenantRegistry;
 
-pub fn spawn_reaper(
-    registry: Arc<TenantRegistry>,
-    queue_names: Vec<String>,
-    interval_secs: u64,
-) {
+pub fn spawn_reaper(registry: Arc<TenantRegistry>, queue_names: Vec<String>, interval_secs: u64) {
     tokio::spawn(async move {
         let mut interval = time::interval(Duration::from_secs(interval_secs));
 
@@ -30,7 +26,7 @@ pub fn spawn_reaper(
     });
 }
 
-fn reap_inflight(
+pub fn reap_inflight(
     registry: &TenantRegistry,
     tenant_id: &str,
     queue: &str,
@@ -47,6 +43,12 @@ fn reap_inflight(
         .ok_or_else(|| {
             crate::error::QueueError::ColumnFamilyMissing(format!("{tenant_id}__pending"))
         })?;
+    let dlq_cf = registry
+        .db
+        .cf_handle(&format!("{tenant_id}__dlq"))
+        .ok_or_else(|| {
+            crate::error::QueueError::ColumnFamilyMissing(format!("{tenant_id}__dlq"))
+        })?;
 
     let prefix = queue_prefix(queue);
     let iter = registry.db.iterator_cf(
@@ -57,13 +59,23 @@ fn reap_inflight(
 
     let mut batch = WriteBatch::default();
     let mut reclaimed = 0usize;
+    let mut poisoned = 0usize;
 
     for item in iter {
         let (key, value) = item?;
         if !key.starts_with(&prefix) {
             break;
         }
-        let task = Task::deserialize(&value)?;
+        let task = match Task::deserialize(&value) {
+            Ok(task) => task,
+            Err(e) => {
+                warn!("Corrupt inflight record in {tenant_id}/{queue}, routing to DLQ: {e}");
+                batch.delete_cf(&inflight_cf, &key);
+                batch.put_cf(&dlq_cf, &key, &Task::poison(queue, &value).serialize()?);
+                poisoned += 1;
+                continue;
+            }
+        };
         if task.deadline > 0 && task.deadline < now {
             let mut reclaimed_task = task;
             reclaimed_task.deadline = 0;
@@ -75,11 +87,11 @@ fn reap_inflight(
         }
     }
 
-    if reclaimed > 0 {
+    if reclaimed > 0 || poisoned > 0 {
         let mut write_opts = rocksdb::WriteOptions::default();
         write_opts.set_sync(false);
         registry.db.write_opt(batch, &write_opts)?;
-        debug!("Reaper reclaimed {reclaimed} tasks from {tenant_id}/{queue}");
+        debug!("Reaper reclaimed {reclaimed} tasks ({poisoned} poison) from {tenant_id}/{queue}");
     }
 
     Ok(())

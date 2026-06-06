@@ -50,9 +50,7 @@ pub fn spawn_stats_daemon(
                 if let Some(promotion) = baselines.update(&s.tenant_id, s.arrival_rate) {
                     info!(
                         "Baseline promoted for {}: {:.2} → {:.2}",
-                        promotion.tenant_id,
-                        promotion.old_threshold,
-                        promotion.new_threshold
+                        promotion.tenant_id, promotion.old_threshold, promotion.new_threshold
                     );
                     // Flush baseline immediately on promotion
                     if let Some(baseline) = baselines.snapshot(&s.tenant_id) {

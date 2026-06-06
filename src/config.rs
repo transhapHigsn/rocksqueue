@@ -36,8 +36,7 @@ impl Config {
                 .unwrap_or_else(|_| "./data/rocksqueue-wal".to_string()),
         );
         let checkpoint_path = PathBuf::from(
-            std::env::var("CHECKPOINT_PATH")
-                .unwrap_or_else(|_| "./data/checkpoints".to_string()),
+            std::env::var("CHECKPOINT_PATH").unwrap_or_else(|_| "./data/checkpoints".to_string()),
         );
 
         let grpc_addr = std::env::var("GRPC_ADDR")

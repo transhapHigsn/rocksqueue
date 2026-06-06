@@ -6,7 +6,7 @@ use std::time::Duration;
 use dashmap::DashMap;
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamilyDescriptor, CompactionDecision, DBCompressionType,
-    Options, WriteBatch, WriteOptions, DB,
+    Options, PrefixRange, ReadOptions, SliceTransform, WriteBatch, WriteOptions, DB,
 };
 use tracing::{debug, info, warn};
 
@@ -15,7 +15,7 @@ use crate::compaction::{
 };
 use crate::error::{QueueError, Result};
 use crate::policy::{BacklogPolicy, NamespacePolicy};
-use crate::task::{encode_key, now_millis, queue_prefix, Task};
+use crate::task::{decode_key_seq, encode_key, now_millis, queue_prefix, Task};
 
 pub struct DbConfig {
     pub sst_path: String,
@@ -58,6 +58,7 @@ fn cf_dlq(tenant: &str) -> String {
     format!("{tenant}__dlq")
 }
 const CF_SYSTEM: &str = "__system__";
+const DEFAULT_VISIBILITY_TIMEOUT_MS: u64 = 60_000;
 
 pub struct TenantRegistry {
     pub db: Arc<DB>,
@@ -75,6 +76,24 @@ pub struct TenantRegistry {
 const TENANT_META_PREFIX: &[u8] = b"tenant:";
 
 impl TenantRegistry {
+    fn queue_prefix_transform(key: &[u8]) -> &[u8] {
+        key.iter()
+            .position(|b| *b == 0x00)
+            .map(|idx| &key[..=idx])
+            .unwrap_or(key)
+    }
+
+    fn queue_prefix_in_domain(key: &[u8]) -> bool {
+        key.contains(&0x00)
+    }
+
+    fn queue_read_opts(prefix: &[u8]) -> ReadOptions {
+        let mut opts = ReadOptions::default();
+        opts.set_iterate_range(PrefixRange(prefix.to_vec()));
+        opts.set_prefix_same_as_start(true);
+        opts
+    }
+
     /// Read all tenant policies persisted in __system__ CF without acquiring a long-lived handle.
     /// Uses a temporary DB open that drops (and releases the lock) before the real open.
     fn load_persisted_tenants(cfg: &DbConfig) -> Result<Vec<(String, NamespacePolicy)>> {
@@ -112,8 +131,7 @@ impl TenantRegistry {
             if !key.starts_with(TENANT_META_PREFIX) {
                 break;
             }
-            let tenant_id =
-                String::from_utf8_lossy(&key[TENANT_META_PREFIX.len()..]).into_owned();
+            let tenant_id = String::from_utf8_lossy(&key[TENANT_META_PREFIX.len()..]).into_owned();
             let policy: NamespacePolicy = bincode::deserialize(&value)?;
             tenants.push((tenant_id, policy));
         }
@@ -232,6 +250,12 @@ impl TenantRegistry {
         opts.set_write_buffer_size(write_buffer_bytes);
         opts.set_max_write_buffer_number(max_write_buffers);
         opts.set_min_write_buffer_number_to_merge(2);
+        opts.set_prefix_extractor(SliceTransform::create(
+            "queue_prefix",
+            Self::queue_prefix_transform,
+            Some(Self::queue_prefix_in_domain),
+        ));
+        opts.set_memtable_prefix_bloom_ratio(0.1);
         opts.set_level_zero_file_num_compaction_trigger(4);
         opts.set_level_zero_slowdown_writes_trigger(12);
         opts.set_level_zero_stop_writes_trigger(20);
@@ -254,8 +278,6 @@ impl TenantRegistry {
         bbo.set_bloom_filter(10.0, false);
         opts.set_block_based_table_factory(&bbo);
 
-        // No prefix extractor — we use IteratorMode::From with manual prefix checks.
-
         // Register whichever compaction filter was provided
         if let Some(f) = pending_filter {
             opts.set_compaction_filter("pending_filter", f);
@@ -269,11 +291,10 @@ impl TenantRegistry {
     }
 
     pub fn provision_tenant(&self, tenant: &str, policy: NamespacePolicy) -> Result<()> {
-        let cache_ref = Cache::new_lru_cache(self.write_buffer_bytes);
         let retention = policy.retention.clone();
 
         let pending_opts = Self::cf_options_with_filter(
-            &cache_ref,
+            &self.block_cache,
             self.write_buffer_bytes,
             self.max_write_buffers,
             Some(make_pending_filter(
@@ -284,7 +305,7 @@ impl TenantRegistry {
             None::<fn(u32, &[u8], &[u8]) -> CompactionDecision>,
         );
         let inflight_opts = Self::cf_options_with_filter(
-            &cache_ref,
+            &self.block_cache,
             self.write_buffer_bytes,
             self.max_write_buffers,
             None::<fn(u32, &[u8], &[u8]) -> CompactionDecision>,
@@ -295,7 +316,7 @@ impl TenantRegistry {
             None::<fn(u32, &[u8], &[u8]) -> CompactionDecision>,
         );
         let dlq_opts = Self::cf_options_with_filter(
-            &cache_ref,
+            &self.block_cache,
             self.write_buffer_bytes,
             self.max_write_buffers,
             None::<fn(u32, &[u8], &[u8]) -> CompactionDecision>,
@@ -317,8 +338,12 @@ impl TenantRegistry {
             .ok_or_else(|| QueueError::ColumnFamilyMissing(CF_SYSTEM.to_string()))?;
         let meta_key = [TENANT_META_PREFIX, tenant.as_bytes()].concat();
         let meta_value = bincode::serialize(&policy)?;
-        self.db
-            .put_cf_opt(&system_cf, &meta_key, &meta_value, &Self::admin_write_opts())?;
+        self.db.put_cf_opt(
+            &system_cf,
+            &meta_key,
+            &meta_value,
+            &Self::admin_write_opts(),
+        )?;
 
         self.policies.insert(tenant.to_string(), policy);
         info!("Provisioned tenant: {tenant}");
@@ -341,7 +366,8 @@ impl TenantRegistry {
 
         self.policies.remove(tenant);
         // Remove any queue locks for this tenant
-        self.queue_locks.retain(|k, _| !k.starts_with(&format!("{tenant}/")));
+        self.queue_locks
+            .retain(|k, _| !k.starts_with(&format!("{tenant}/")));
         info!("Dropped tenant: {tenant}");
         Ok(())
     }
@@ -512,8 +538,9 @@ impl TenantRegistry {
     fn evict_oldest_pending(&self, tenant: &str, queue: &str, count: usize) -> Result<()> {
         let pending_cf = self.pending_cf(tenant)?;
         let prefix = queue_prefix(queue);
-        let iter = self.db.iterator_cf(
+        let iter = self.db.iterator_cf_opt(
             &pending_cf,
+            Self::queue_read_opts(&prefix),
             rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward),
         );
         let mut batch = WriteBatch::default();
@@ -524,9 +551,6 @@ impl TenantRegistry {
                 break;
             }
             let (key, _) = item?;
-            if !key.starts_with(&prefix) {
-                break;
-            }
             batch.delete_cf(&pending_cf, &key);
             evicted += 1;
         }
@@ -539,24 +563,47 @@ impl TenantRegistry {
     }
 
     pub fn dequeue(&self, tenant: &str, queue: &str, limit: usize) -> Result<Vec<(Vec<u8>, Task)>> {
+        self.dequeue_batch(tenant, queue, limit, DEFAULT_VISIBILITY_TIMEOUT_MS)
+    }
+
+    pub fn dequeue_batch(
+        &self,
+        tenant: &str,
+        queue: &str,
+        limit: usize,
+        visibility_timeout_ms: u64,
+    ) -> Result<Vec<(Vec<u8>, Task)>> {
+        if limit == 0 {
+            return Ok(vec![]);
+        }
+
         let pending_cf = self.pending_cf(tenant)?;
         let inflight_cf = self.inflight_cf(tenant)?;
+        let dlq_cf = self.dlq_cf(tenant)?;
         let prefix = queue_prefix(queue);
-        let iter = self.db.iterator_cf(
+        let iter = self.db.iterator_cf_opt(
             &pending_cf,
+            Self::queue_read_opts(&prefix),
             rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward),
         );
 
         let mut results = Vec::with_capacity(limit);
         let mut batch = WriteBatch::default();
-        let deadline = now_millis() + 60_000; // 60s default visibility
+        let mut poisoned = 0usize;
+        let deadline = now_millis().saturating_add(visibility_timeout_ms);
 
         for item in iter.take(limit) {
             let (key, value) = item?;
-            if !key.starts_with(&prefix) {
-                break;
-            }
-            let mut task = Task::deserialize(&value)?;
+            let mut task = match Task::deserialize(&value) {
+                Ok(task) => task,
+                Err(e) => {
+                    warn!("Corrupt pending record in {tenant}/{queue}, routing to DLQ: {e}");
+                    batch.delete_cf(&pending_cf, &key);
+                    batch.put_cf(&dlq_cf, &key, &Task::poison(queue, &value).serialize()?);
+                    poisoned += 1;
+                    continue;
+                }
+            };
             task.attempts += 1;
             task.deadline = deadline;
             let updated_value = task.serialize()?;
@@ -566,6 +613,82 @@ impl TenantRegistry {
             results.push((key.to_vec(), task));
         }
 
+        if !results.is_empty() || poisoned > 0 {
+            self.db.write_opt(batch, &Self::hot_write_opts())?;
+        }
+        Ok(results)
+    }
+
+    pub fn dequeue_with_max_inflight(
+        &self,
+        tenant: &str,
+        queue: &str,
+        limit: usize,
+        visibility_timeout_ms: u64,
+        max_inflight: usize,
+    ) -> Result<Vec<(Vec<u8>, Task)>> {
+        if max_inflight == 0 {
+            return Ok(vec![]);
+        }
+
+        let inflight = self.count_prefix(self.inflight_cf(tenant)?, queue)?;
+        if inflight >= max_inflight {
+            return Ok(vec![]);
+        }
+
+        self.dequeue_batch(
+            tenant,
+            queue,
+            limit.min(max_inflight - inflight),
+            visibility_timeout_ms,
+        )
+    }
+
+    pub fn dequeue_lease_batch_experimental(
+        &self,
+        tenant: &str,
+        queue: &str,
+        limit: usize,
+        visibility_timeout_ms: u64,
+    ) -> Result<Vec<(Vec<u8>, Task)>> {
+        if limit == 0 {
+            return Ok(vec![]);
+        }
+
+        let pending_cf = self.pending_cf(tenant)?;
+        let inflight_cf = self.inflight_cf(tenant)?;
+        let prefix = queue_prefix(queue);
+        let iter = self.db.iterator_cf_opt(
+            &pending_cf,
+            Self::queue_read_opts(&prefix),
+            rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward),
+        );
+
+        let mut results = Vec::with_capacity(limit);
+        let mut batch = WriteBatch::default();
+        let deadline = now_millis().saturating_add(visibility_timeout_ms);
+
+        for item in iter {
+            let (key, value) = item?;
+            if self.db.get_cf(&inflight_cf, &key)?.is_some() {
+                continue;
+            }
+
+            let mut task = Task::deserialize(&value)?;
+            task.attempts += 1;
+            task.deadline = deadline;
+
+            let mut lease_value = Vec::with_capacity(12);
+            lease_value.extend_from_slice(&task.attempts.to_be_bytes());
+            lease_value.extend_from_slice(&deadline.to_be_bytes());
+            batch.put_cf(&inflight_cf, &key, &lease_value);
+            results.push((key.to_vec(), task));
+
+            if results.len() >= limit {
+                break;
+            }
+        }
+
         if !results.is_empty() {
             self.db.write_opt(batch, &Self::hot_write_opts())?;
         }
@@ -573,10 +696,48 @@ impl TenantRegistry {
     }
 
     pub fn ack(&self, tenant: &str, key: &[u8]) -> Result<()> {
-        let inflight_cf = self.inflight_cf(tenant)?;
-        self.db
-            .delete_cf_opt(&inflight_cf, key, &Self::hot_write_opts())?;
+        self.ack_batch(tenant, std::iter::once(key))?;
         Ok(())
+    }
+
+    pub fn ack_batch<'a, I>(&self, tenant: &str, keys: I) -> Result<usize>
+    where
+        I: IntoIterator<Item = &'a [u8]>,
+    {
+        let inflight_cf = self.inflight_cf(tenant)?;
+        let mut batch = WriteBatch::default();
+        let mut count = 0usize;
+
+        for key in keys {
+            batch.delete_cf(&inflight_cf, key);
+            count += 1;
+        }
+
+        if count > 0 {
+            self.db.write_opt(batch, &Self::hot_write_opts())?;
+        }
+        Ok(count)
+    }
+
+    pub fn ack_lease_batch_experimental<'a, I>(&self, tenant: &str, keys: I) -> Result<usize>
+    where
+        I: IntoIterator<Item = &'a [u8]>,
+    {
+        let pending_cf = self.pending_cf(tenant)?;
+        let inflight_cf = self.inflight_cf(tenant)?;
+        let mut batch = WriteBatch::default();
+        let mut count = 0usize;
+
+        for key in keys {
+            batch.delete_cf(&pending_cf, key);
+            batch.delete_cf(&inflight_cf, key);
+            count += 1;
+        }
+
+        if count > 0 {
+            self.db.write_opt(batch, &Self::hot_write_opts())?;
+        }
+        Ok(count)
     }
 
     pub fn nack(&self, tenant: &str, key: &[u8]) -> Result<()> {
@@ -587,7 +748,20 @@ impl TenantRegistry {
         let max_attempts: u32 = 5;
 
         if let Some(value) = self.db.get_cf(&inflight_cf, key)? {
-            let task = Task::deserialize(&value)?;
+            let task = match Task::deserialize(&value) {
+                Ok(task) => task,
+                Err(e) => {
+                    warn!("Corrupt inflight record in nack for {tenant}, routing to DLQ: {e}");
+                    let queue = String::from_utf8_lossy(
+                        &key[..key.iter().position(|b| *b == 0x00).unwrap_or(key.len())],
+                    );
+                    let mut batch = WriteBatch::default();
+                    batch.delete_cf(&inflight_cf, key);
+                    batch.put_cf(&dlq_cf, key, &Task::poison(&queue, &value).serialize()?);
+                    self.db.write_opt(batch, &Self::hot_write_opts())?;
+                    return Ok(());
+                }
+            };
             let mut batch = WriteBatch::default();
             batch.delete_cf(&inflight_cf, key);
 
@@ -613,8 +787,9 @@ impl TenantRegistry {
     pub fn cumulative_ack(&self, tenant: &str, queue: &str, up_to_seq: u64) -> Result<usize> {
         let inflight_cf = self.inflight_cf(tenant)?;
         let prefix = queue_prefix(queue);
-        let iter = self.db.iterator_cf(
+        let iter = self.db.iterator_cf_opt(
             &inflight_cf,
+            Self::queue_read_opts(&prefix),
             rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward),
         );
 
@@ -623,22 +798,17 @@ impl TenantRegistry {
 
         for item in iter {
             let (key, _) = item?;
-            if !key.starts_with(&prefix) {
-                break;
-            }
-            // Extract seq from last 8 bytes
-            if key.len() >= 8 {
-                let seq_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap_or([0u8; 8]);
-                let seq = u64::from_be_bytes(seq_bytes);
-                if seq <= up_to_seq {
-                    batch.delete_cf(&inflight_cf, &key);
-                    count += 1;
+            if let Some(seq) = decode_key_seq(&key) {
+                if seq > up_to_seq {
+                    break;
                 }
+                batch.delete_cf(&inflight_cf, &key);
+                count += 1;
             }
         }
 
         if count > 0 {
-            self.db.write_opt(batch, &Self::admin_write_opts())?;
+            self.db.write_opt(batch, &Self::hot_write_opts())?;
         }
         Ok(count)
     }
@@ -651,22 +821,16 @@ impl TenantRegistry {
         Ok((pending, inflight, dlq))
     }
 
-    fn count_prefix(
-        &self,
-        cf: Arc<rocksdb::BoundColumnFamily>,
-        queue: &str,
-    ) -> Result<usize> {
+    fn count_prefix(&self, cf: Arc<rocksdb::BoundColumnFamily>, queue: &str) -> Result<usize> {
         let prefix = queue_prefix(queue);
-        let iter = self.db.iterator_cf(
+        let iter = self.db.iterator_cf_opt(
             &cf,
+            Self::queue_read_opts(&prefix),
             rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward),
         );
         let mut count = 0;
         for item in iter {
-            let (key, _) = item?;
-            if !key.starts_with(&prefix) {
-                break;
-            }
+            item?;
             count += 1;
         }
         Ok(count)
@@ -760,8 +924,12 @@ impl TenantRegistry {
             .ok_or_else(|| QueueError::ColumnFamilyMissing(CF_SYSTEM.to_string()))?;
         let meta_key = [TENANT_META_PREFIX, tenant.as_bytes()].concat();
         let meta_value = bincode::serialize(&policy)?;
-        self.db
-            .put_cf_opt(&system_cf, &meta_key, &meta_value, &Self::admin_write_opts())?;
+        self.db.put_cf_opt(
+            &system_cf,
+            &meta_key,
+            &meta_value,
+            &Self::admin_write_opts(),
+        )?;
         self.policies.insert(tenant.to_string(), policy);
         Ok(())
     }

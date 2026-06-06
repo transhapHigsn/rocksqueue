@@ -5,8 +5,8 @@ use rocksdb::{WriteOptions, DB};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::stats::TenantStats;
 use crate::baseline::TenantBaseline;
+use crate::stats::TenantStats;
 
 fn now_millis() -> u64 {
     SystemTime::now()
@@ -69,9 +69,7 @@ impl StatsStore {
     }
 
     fn cf(&self) -> Arc<rocksdb::BoundColumnFamily> {
-        self.db
-            .cf_handle(CF_SYSTEM)
-            .expect("__system__ CF missing")
+        self.db.cf_handle(CF_SYSTEM).expect("__system__ CF missing")
     }
 
     pub fn flush_stats(&self, stats: &[TenantStats]) {
@@ -94,7 +92,10 @@ impl StatsStore {
             let key = format!("stats:{}", s.tenant_id);
             match bincode::serialize(&record) {
                 Ok(value) => {
-                    if let Err(e) = self.db.put_cf_opt(&cf, key.as_bytes(), &value, &Self::sync_write_opts()) {
+                    if let Err(e) =
+                        self.db
+                            .put_cf_opt(&cf, key.as_bytes(), &value, &Self::sync_write_opts())
+                    {
                         warn!("Failed to flush stats for {}: {e}", s.tenant_id);
                     }
                 }
@@ -107,7 +108,10 @@ impl StatsStore {
     pub fn load_all_stats(&self) -> Vec<PersistedStats> {
         let cf = self.cf();
         let prefix = b"stats:";
-        let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward));
+        let iter = self.db.iterator_cf(
+            &cf,
+            rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
+        );
         let now = now_millis();
         let mut results = Vec::new();
 
@@ -145,7 +149,10 @@ impl StatsStore {
         let key = format!("throttle:{}", state.tenant_id);
         match bincode::serialize(state) {
             Ok(value) => {
-                if let Err(e) = self.db.put_cf_opt(&cf, key.as_bytes(), &value, &Self::sync_write_opts()) {
+                if let Err(e) =
+                    self.db
+                        .put_cf_opt(&cf, key.as_bytes(), &value, &Self::sync_write_opts())
+                {
                     warn!("Failed to persist throttle for {}: {e}", state.tenant_id);
                 }
             }
@@ -156,7 +163,10 @@ impl StatsStore {
     pub fn clear_throttle(&self, tenant_id: &str) {
         let cf = self.cf();
         let key = format!("throttle:{tenant_id}");
-        if let Err(e) = self.db.delete_cf_opt(&cf, key.as_bytes(), &Self::sync_write_opts()) {
+        if let Err(e) = self
+            .db
+            .delete_cf_opt(&cf, key.as_bytes(), &Self::sync_write_opts())
+        {
             warn!("Failed to clear throttle for {tenant_id}: {e}");
         }
     }
@@ -164,7 +174,10 @@ impl StatsStore {
     pub fn load_all_throttles(&self) -> Vec<PersistedThrottle> {
         let cf = self.cf();
         let prefix = b"throttle:";
-        let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward));
+        let iter = self.db.iterator_cf(
+            &cf,
+            rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
+        );
         let mut results = Vec::new();
 
         for item in iter {
@@ -198,7 +211,10 @@ impl StatsStore {
             let key = format!("baseline:{}", b.tenant_id);
             match bincode::serialize(&record) {
                 Ok(value) => {
-                    if let Err(e) = self.db.put_cf_opt(&cf, key.as_bytes(), &value, &Self::sync_write_opts()) {
+                    if let Err(e) =
+                        self.db
+                            .put_cf_opt(&cf, key.as_bytes(), &value, &Self::sync_write_opts())
+                    {
                         warn!("Failed to flush baseline for {}: {e}", b.tenant_id);
                     }
                 }
@@ -210,17 +226,24 @@ impl StatsStore {
     pub fn load_baseline(&self, tenant_id: &str) -> Option<BaselineRecord> {
         let cf = self.cf();
         let key = format!("baseline:{tenant_id}");
-        self.db.get_cf(&cf, key.as_bytes()).ok().flatten().and_then(|v| {
-            bincode::deserialize::<BaselineRecord>(&v)
-                .map_err(|e| warn!("Failed to deserialize baseline for {tenant_id}: {e}"))
-                .ok()
-        })
+        self.db
+            .get_cf(&cf, key.as_bytes())
+            .ok()
+            .flatten()
+            .and_then(|v| {
+                bincode::deserialize::<BaselineRecord>(&v)
+                    .map_err(|e| warn!("Failed to deserialize baseline for {tenant_id}: {e}"))
+                    .ok()
+            })
     }
 
     pub fn clear_baseline(&self, tenant_id: &str) {
         let cf = self.cf();
         let key = format!("baseline:{tenant_id}");
-        if let Err(e) = self.db.delete_cf_opt(&cf, key.as_bytes(), &Self::sync_write_opts()) {
+        if let Err(e) = self
+            .db
+            .delete_cf_opt(&cf, key.as_bytes(), &Self::sync_write_opts())
+        {
             warn!("Failed to clear baseline for {tenant_id}: {e}");
         }
     }

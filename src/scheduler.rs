@@ -158,7 +158,8 @@ impl WFQScheduler {
             if let Some(mut state) = self.tenants.get_mut(tenant_id) {
                 state.tokens -= slots as f64;
                 let packet_size = slots as f64;
-                let new_vft = vt.max(state.virtual_finish_time) + packet_size / (*weight).max(1) as f64;
+                let new_vft =
+                    vt.max(state.virtual_finish_time) + packet_size / (*weight).max(1) as f64;
                 state.virtual_finish_time = new_vft;
                 state.inflight += slots;
             }
@@ -200,9 +201,7 @@ impl WFQScheduler {
     }
 
     pub fn policy(&self, tenant_id: &str) -> Option<TenantPolicy> {
-        self.tenants
-            .get(tenant_id)
-            .map(|e| e.policy.clone())
+        self.tenants.get(tenant_id).map(|e| e.policy.clone())
     }
 
     pub fn baseline_rate(&self, tenant_id: &str) -> Option<f64> {
@@ -211,18 +210,10 @@ impl WFQScheduler {
             .map(|e| e.policy.rate_per_sec as f64)
     }
 
-    pub fn tenant_snapshot(
-        &self,
-        id: &str,
-    ) -> Option<(TenantPolicy, f64, bool, Instant)> {
-        self.tenants.get(id).map(|e| {
-            (
-                e.policy.clone(),
-                e.tokens,
-                e.paused,
-                e.created_at,
-            )
-        })
+    pub fn tenant_snapshot(&self, id: &str) -> Option<(TenantPolicy, f64, bool, Instant)> {
+        self.tenants
+            .get(id)
+            .map(|e| (e.policy.clone(), e.tokens, e.paused, e.created_at))
     }
 
     pub fn all_tenant_ids(&self) -> Vec<String> {
@@ -232,14 +223,7 @@ impl WFQScheduler {
     pub fn all_snapshots(&self) -> Vec<(String, TenantPolicy, f64, usize)> {
         self.tenants
             .iter()
-            .map(|e| {
-                (
-                    e.key().clone(),
-                    e.policy.clone(),
-                    e.tokens,
-                    e.inflight,
-                )
-            })
+            .map(|e| (e.key().clone(), e.policy.clone(), e.tokens, e.inflight))
             .collect()
     }
 }

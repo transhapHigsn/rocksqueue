@@ -1,6 +1,6 @@
 use std::sync::Arc;
-use std::time::Instant;
 use std::time::Duration;
+use std::time::Instant;
 
 use tokio::time;
 use tracing::{debug, warn};
@@ -62,8 +62,7 @@ impl FairWorkerPool {
                         let start = Instant::now();
                         match (self.handler)(&tenant_id, task) {
                             Ok(()) => {
-                                self.collector
-                                    .record_ack(&tenant_id, start.elapsed());
+                                self.collector.record_ack(&tenant_id, start.elapsed());
                                 if let Err(e) = self.registry.ack(&tenant_id, &key) {
                                     warn!("Ack error for {tenant_id}: {e}");
                                 }

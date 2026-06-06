@@ -17,6 +17,8 @@ use crate::stats::StatsCollector;
 use crate::tenant::TenantRegistry;
 use crate::throttle::AutoThrottle;
 
+const DEFAULT_DEQUEUE_LIMIT: usize = 500;
+
 pub struct ControlPlaneService {
     registry: Arc<TenantRegistry>,
     scheduler: Arc<WFQScheduler>,
@@ -405,11 +407,19 @@ impl ControlPlane for ControlPlaneService {
     ) -> Result<Response<DequeueResponse>, Status> {
         let req = request.into_inner();
         let queue = queue_or_default(req.queue);
-        let limit = req.limit.max(1) as usize;
+        let limit = if req.limit == 0 {
+            DEFAULT_DEQUEUE_LIMIT
+        } else {
+            req.limit as usize
+        };
+        let policy = self
+            .registry
+            .get_policy(&req.tenant_id)
+            .ok_or_else(|| not_found("tenant not found"))?;
 
         let tasks = self
             .registry
-            .dequeue(&req.tenant_id, &queue, limit)
+            .dequeue_with_max_inflight(&req.tenant_id, &queue, limit, 60_000, policy.max_inflight)
             .map_err(queue_error)?
             .into_iter()
             .map(|(key, task)| DequeuedTask {
@@ -447,6 +457,35 @@ impl ControlPlane for ControlPlaneService {
             tenant_id: req.tenant_id,
             success: true,
             message: "acked".to_string(),
+        }))
+    }
+
+    async fn ack_batch(
+        &self,
+        request: Request<TaskAckBatchRequest>,
+    ) -> Result<Response<TaskOpResponse>, Status> {
+        let req = request.into_inner();
+        if req.ack_keys.is_empty() {
+            return Err(Status::invalid_argument("ack_keys must not be empty"));
+        }
+
+        let keys: Vec<Vec<u8>> = req
+            .ack_keys
+            .iter()
+            .map(|ack_key| decode_ack_key(ack_key))
+            .collect::<Result<_, _>>()?;
+
+        let count = self
+            .registry
+            .ack_batch(&req.tenant_id, keys.iter().map(Vec::as_slice))
+            .map_err(queue_error)?;
+        self.collector
+            .record_ack_count(&req.tenant_id, count as u64, Duration::from_millis(0));
+
+        Ok(Response::new(TaskOpResponse {
+            tenant_id: req.tenant_id,
+            success: true,
+            message: format!("acked {count}"),
         }))
     }
 

@@ -92,10 +92,8 @@ impl StatsCollector {
             total_nacked: 0,
             stats_version: 0,
         };
-        self.tenants.insert(
-            tenant_id.to_string(),
-            TenantStatsState { stats, counters },
-        );
+        self.tenants
+            .insert(tenant_id.to_string(), TenantStatsState { stats, counters });
     }
 
     pub fn deregister(&self, tenant_id: &str) {
@@ -104,19 +102,32 @@ impl StatsCollector {
 
     pub fn record_enqueue(&self, tenant_id: &str, count: u64) {
         if let Some(state) = self.tenants.get(tenant_id) {
-            state.counters.enqueue_count.fetch_add(count, Ordering::Relaxed);
-            state.counters.total_enqueued.fetch_add(count, Ordering::Relaxed);
+            state
+                .counters
+                .enqueue_count
+                .fetch_add(count, Ordering::Relaxed);
+            state
+                .counters
+                .total_enqueued
+                .fetch_add(count, Ordering::Relaxed);
         }
     }
 
     pub fn record_ack(&self, tenant_id: &str, latency: Duration) {
+        self.record_ack_count(tenant_id, 1, latency);
+    }
+
+    pub fn record_ack_count(&self, tenant_id: &str, count: u64, latency: Duration) {
         if let Some(state) = self.tenants.get(tenant_id) {
-            state.counters.ack_count.fetch_add(1, Ordering::Relaxed);
+            state.counters.ack_count.fetch_add(count, Ordering::Relaxed);
             state
                 .counters
                 .latency_sum_ms
-                .fetch_add(latency.as_millis() as u64, Ordering::Relaxed);
-            state.counters.total_acked.fetch_add(1, Ordering::Relaxed);
+                .fetch_add((latency.as_millis() as u64) * count, Ordering::Relaxed);
+            state
+                .counters
+                .total_acked
+                .fetch_add(count, Ordering::Relaxed);
         }
     }
 
@@ -169,14 +180,11 @@ impl StatsCollector {
             // burst_score: EMA of deviation² from arrival_rate (variance proxy)
             let deviation = new_arrival - state.stats.arrival_rate;
             let new_burst = deviation * deviation;
-            state.stats.burst_score =
-                alpha * new_burst + (1.0 - alpha) * state.stats.burst_score;
+            state.stats.burst_score = alpha * new_burst + (1.0 - alpha) * state.stats.burst_score;
 
-            state.stats.total_enqueued =
-                state.counters.total_enqueued.load(Ordering::Relaxed);
+            state.stats.total_enqueued = state.counters.total_enqueued.load(Ordering::Relaxed);
             state.stats.total_acked = state.counters.total_acked.load(Ordering::Relaxed);
-            state.stats.total_nacked =
-                state.counters.total_nacked.load(Ordering::Relaxed);
+            state.stats.total_nacked = state.counters.total_nacked.load(Ordering::Relaxed);
             state.stats.stats_version += 1;
 
             // After first activity, mark as not new
@@ -217,20 +225,13 @@ impl StatsCollector {
             return vec![];
         }
 
-        let all: Vec<TenantStats> = self
-            .tenants
-            .iter()
-            .map(|e| e.stats.clone())
-            .collect();
+        let all: Vec<TenantStats> = self.tenants.iter().map(|e| e.stats.clone()).collect();
 
         let guaranteed: Vec<&TenantStats> = all
             .iter()
             .filter(|s| {
-                let dormant = s
-                    .last_enqueue_at
-                    .elapsed()
-                    .as_secs_f64()
-                    > self.dormancy_threshold_secs;
+                let dormant =
+                    s.last_enqueue_at.elapsed().as_secs_f64() > self.dormancy_threshold_secs;
                 s.is_new || dormant
             })
             .collect();
@@ -238,11 +239,8 @@ impl StatsCollector {
         let normal: Vec<&TenantStats> = all
             .iter()
             .filter(|s| {
-                let dormant = s
-                    .last_enqueue_at
-                    .elapsed()
-                    .as_secs_f64()
-                    > self.dormancy_threshold_secs;
+                let dormant =
+                    s.last_enqueue_at.elapsed().as_secs_f64() > self.dormancy_threshold_secs;
                 !(s.is_new || dormant)
             })
             .collect();
@@ -282,7 +280,10 @@ impl StatsCollector {
                     .partial_cmp(&a.0.backlog_ratio)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
-            if let Some(entry) = allocations.iter_mut().find(|(id, _)| *id == scored[0].0.tenant_id) {
+            if let Some(entry) = allocations
+                .iter_mut()
+                .find(|(id, _)| *id == scored[0].0.tenant_id)
+            {
                 entry.1 += leftover;
             }
         }

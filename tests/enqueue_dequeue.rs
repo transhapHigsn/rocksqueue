@@ -1,4 +1,5 @@
 use rocksqueue::policy::NamespacePolicy;
+use rocksqueue::task::decode_key_seq;
 use rocksqueue::tenant::{DbConfig, TenantRegistry};
 use tempfile::TempDir;
 
@@ -51,6 +52,134 @@ fn test_ack_removes_from_inflight() {
 
     let (_, inflight_after, _) = registry.depth("acme", "default").unwrap();
     assert_eq!(inflight_after, 0);
+}
+
+#[test]
+fn test_ack_batch_removes_multiple_inflight_tasks() {
+    let tmp = TempDir::new().unwrap();
+    let registry = make_registry(&tmp);
+    let policy = NamespacePolicy::standard("acme");
+    registry.provision_tenant("acme", policy.clone()).unwrap();
+
+    for i in 0..5 {
+        registry
+            .enqueue("acme", "default", format!("task{i}").into_bytes(), &policy)
+            .unwrap();
+    }
+
+    let tasks = registry.dequeue("acme", "default", 5).unwrap();
+    let keys: Vec<Vec<u8>> = tasks.into_iter().map(|(key, _)| key).collect();
+    let acked = registry
+        .ack_batch("acme", keys.iter().map(Vec::as_slice))
+        .unwrap();
+
+    assert_eq!(acked, 5);
+    let (pending, inflight, _) = registry.depth("acme", "default").unwrap();
+    assert_eq!(pending, 0);
+    assert_eq!(inflight, 0);
+}
+
+#[test]
+fn test_dequeue_batch_uses_custom_visibility_timeout() {
+    let tmp = TempDir::new().unwrap();
+    let registry = make_registry(&tmp);
+    let policy = NamespacePolicy::standard("acme");
+    registry.provision_tenant("acme", policy.clone()).unwrap();
+
+    registry
+        .enqueue("acme", "default", b"task1".to_vec(), &policy)
+        .unwrap();
+
+    let before = rocksqueue::task::now_millis();
+    let tasks = registry.dequeue_batch("acme", "default", 1, 5_000).unwrap();
+
+    assert_eq!(tasks.len(), 1);
+    assert!(tasks[0].1.deadline >= before + 5_000);
+    assert!(tasks[0].1.deadline < before + 10_000);
+}
+
+#[test]
+fn test_dequeue_with_max_inflight_caps_delivery() {
+    let tmp = TempDir::new().unwrap();
+    let registry = make_registry(&tmp);
+    let policy = NamespacePolicy::standard("acme");
+    registry.provision_tenant("acme", policy.clone()).unwrap();
+
+    for i in 0..5 {
+        registry
+            .enqueue("acme", "default", format!("task{i}").into_bytes(), &policy)
+            .unwrap();
+    }
+
+    let first = registry
+        .dequeue_with_max_inflight("acme", "default", 5, 60_000, 3)
+        .unwrap();
+    let second = registry
+        .dequeue_with_max_inflight("acme", "default", 5, 60_000, 3)
+        .unwrap();
+
+    assert_eq!(first.len(), 3);
+    assert!(second.is_empty());
+    let (pending, inflight, _) = registry.depth("acme", "default").unwrap();
+    assert_eq!(pending, 2);
+    assert_eq!(inflight, 3);
+}
+
+#[test]
+fn test_experimental_lease_dequeue_ack_removes_pending_and_inflight() {
+    let tmp = TempDir::new().unwrap();
+    let registry = make_registry(&tmp);
+    let policy = NamespacePolicy::standard("acme");
+    registry.provision_tenant("acme", policy.clone()).unwrap();
+
+    for i in 0..5 {
+        registry
+            .enqueue("acme", "default", format!("task{i}").into_bytes(), &policy)
+            .unwrap();
+    }
+
+    let tasks = registry
+        .dequeue_lease_batch_experimental("acme", "default", 5, 60_000)
+        .unwrap();
+    let keys: Vec<Vec<u8>> = tasks.into_iter().map(|(key, _)| key).collect();
+
+    let (pending_before_ack, inflight_before_ack, _) = registry.depth("acme", "default").unwrap();
+    assert_eq!(pending_before_ack, 5);
+    assert_eq!(inflight_before_ack, 5);
+
+    let acked = registry
+        .ack_lease_batch_experimental("acme", keys.iter().map(Vec::as_slice))
+        .unwrap();
+
+    assert_eq!(acked, 5);
+    let (pending, inflight, _) = registry.depth("acme", "default").unwrap();
+    assert_eq!(pending, 0);
+    assert_eq!(inflight, 0);
+}
+
+#[test]
+fn test_cumulative_ack_removes_ordered_prefix() {
+    let tmp = TempDir::new().unwrap();
+    let registry = make_registry(&tmp);
+    let policy = NamespacePolicy::standard("acme");
+    registry.provision_tenant("acme", policy.clone()).unwrap();
+
+    for i in 0..5 {
+        registry
+            .enqueue("acme", "default", format!("task{i}").into_bytes(), &policy)
+            .unwrap();
+    }
+
+    let tasks = registry.dequeue("acme", "default", 5).unwrap();
+    let up_to_seq = decode_key_seq(&tasks[2].0).unwrap();
+    let acked = registry
+        .cumulative_ack("acme", "default", up_to_seq)
+        .unwrap();
+
+    assert_eq!(acked, 3);
+    let (pending, inflight, _) = registry.depth("acme", "default").unwrap();
+    assert_eq!(pending, 0);
+    assert_eq!(inflight, 2);
 }
 
 #[test]

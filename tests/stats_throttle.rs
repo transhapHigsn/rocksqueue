@@ -16,7 +16,10 @@ fn test_stats_ema_converges() {
 
     let stats = collector.snapshot("acme").unwrap();
     // After 10 cycles at 100/cycle, EMA should be close to 100
-    assert!(stats.arrival_rate > 50.0, "EMA should be converging toward 100");
+    assert!(
+        stats.arrival_rate > 50.0,
+        "EMA should be converging toward 100"
+    );
     assert!(!stats.is_new, "Should not be new after enqueues");
 }
 
@@ -55,9 +58,20 @@ fn test_allocate_slots_proportional() {
 
     let allocs = collector.allocate_slots(110);
     // heavy should get more slots than light
-    let heavy_slots: usize = allocs.iter().find(|(id, _)| id == "heavy").map(|(_, s)| *s).unwrap_or(0);
-    let light_slots: usize = allocs.iter().find(|(id, _)| id == "light").map(|(_, s)| *s).unwrap_or(0);
-    assert!(heavy_slots >= light_slots, "heavy should get >= slots as light");
+    let heavy_slots: usize = allocs
+        .iter()
+        .find(|(id, _)| id == "heavy")
+        .map(|(_, s)| *s)
+        .unwrap_or(0);
+    let light_slots: usize = allocs
+        .iter()
+        .find(|(id, _)| id == "light")
+        .map(|(_, s)| *s)
+        .unwrap_or(0);
+    assert!(
+        heavy_slots >= light_slots,
+        "heavy should get >= slots as light"
+    );
 }
 
 #[test]
@@ -70,6 +84,13 @@ fn test_new_tenant_gets_guaranteed_slots() {
     assert!(stats.is_new);
 
     let allocs = collector.allocate_slots(100);
-    let slots = allocs.iter().find(|(id, _)| id == "brand_new").map(|(_, s)| *s).unwrap_or(0);
-    assert!(slots >= collector.min_guarantee_slots, "new tenant must get guaranteed slots");
+    let slots = allocs
+        .iter()
+        .find(|(id, _)| id == "brand_new")
+        .map(|(_, s)| *s)
+        .unwrap_or(0);
+    assert!(
+        slots >= collector.min_guarantee_slots,
+        "new tenant must get guaranteed slots"
+    );
 }

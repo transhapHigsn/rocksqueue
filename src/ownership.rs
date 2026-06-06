@@ -29,9 +29,7 @@ impl OwnershipMap {
     }
 
     pub fn owner_of(&self, tenant_id: &str) -> Option<String> {
-        self.assignments
-            .get(tenant_id)
-            .map(|e| e.value().clone())
+        self.assignments.get(tenant_id).map(|e| e.value().clone())
     }
 
     /// In single-node mode, always returns true (owns all tenants).

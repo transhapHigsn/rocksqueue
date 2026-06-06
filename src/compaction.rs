@@ -77,22 +77,20 @@ pub fn make_dlq_filter(
     dlq_retention_secs: u64,
     counters: Arc<CompactionCounters>,
 ) -> impl Fn(u32, &[u8], &[u8]) -> Decision {
-    move |_level, _key, value| {
-        match Task::deserialize(value) {
-            Ok(task) => {
-                let age_ms = now_millis().saturating_sub(task.enqueued_at);
-                if age_ms > dlq_retention_secs * 1000 {
-                    counters.dlq_expired.fetch_add(1, Ordering::Relaxed);
-                    Decision::Remove
-                } else {
-                    counters.kept.fetch_add(1, Ordering::Relaxed);
-                    Decision::Keep
-                }
-            }
-            Err(_) => {
+    move |_level, _key, value| match Task::deserialize(value) {
+        Ok(task) => {
+            let age_ms = now_millis().saturating_sub(task.enqueued_at);
+            if age_ms > dlq_retention_secs * 1000 {
                 counters.dlq_expired.fetch_add(1, Ordering::Relaxed);
                 Decision::Remove
+            } else {
+                counters.kept.fetch_add(1, Ordering::Relaxed);
+                Decision::Keep
             }
+        }
+        Err(_) => {
+            counters.dlq_expired.fetch_add(1, Ordering::Relaxed);
+            Decision::Remove
         }
     }
 }

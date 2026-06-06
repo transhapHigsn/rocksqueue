@@ -24,6 +24,7 @@ service ControlPlane {
   rpc EnqueueBatch         (EnqueueBatchRequest)     returns (EnqueueResponse);
   rpc DequeueTasks         (DequeueRequest)          returns (DequeueResponse);
   rpc AckTask              (TaskAckRequest)          returns (TaskOpResponse);
+  rpc AckBatch             (TaskAckBatchRequest)     returns (TaskOpResponse);
   rpc NackTask             (TaskAckRequest)          returns (TaskOpResponse);
 
   // Stats
@@ -188,6 +189,11 @@ message DequeueResponse {
 message TaskAckRequest {
   string tenant_id = 1;
   string ack_key   = 2;
+}
+
+message TaskAckBatchRequest {
+  string tenant_id          = 1;
+  repeated string ack_keys  = 2;
 }
 
 message TaskOpResponse {

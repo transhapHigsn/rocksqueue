@@ -35,7 +35,10 @@ fn test_reject_policy_exceeds_quota() {
 
     // Enqueue 1 more — should fail
     let result = registry.enqueue("acme", "default", b"overflow".to_vec(), &policy);
-    assert!(matches!(result, Err(QueueError::BacklogQuotaExceeded { .. })));
+    assert!(matches!(
+        result,
+        Err(QueueError::BacklogQuotaExceeded { .. })
+    ));
 }
 
 #[test]
@@ -101,12 +104,7 @@ fn test_concurrent_quota_not_exceeded() {
             let pol = policy.clone();
             std::thread::spawn(move || {
                 for j in 0..5 {
-                    let _ = reg.enqueue(
-                        "acme",
-                        "default",
-                        format!("t{i}_{j}").into_bytes(),
-                        &pol,
-                    );
+                    let _ = reg.enqueue("acme", "default", format!("t{i}_{j}").into_bytes(), &pol);
                 }
             })
         })

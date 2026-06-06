@@ -192,14 +192,10 @@ impl BaselineRegistry {
         self.baselines.remove(tenant_id);
     }
 
-    pub fn update(
-        &self,
-        tenant_id: &str,
-        arrival_rate: f64,
-    ) -> Option<BaselinePromotion> {
-        self.baselines.get_mut(tenant_id).and_then(|mut b| {
-            b.update(arrival_rate, 0.2, 0.01, 3.0)
-        })
+    pub fn update(&self, tenant_id: &str, arrival_rate: f64) -> Option<BaselinePromotion> {
+        self.baselines
+            .get_mut(tenant_id)
+            .and_then(|mut b| b.update(arrival_rate, 0.2, 0.01, 3.0))
     }
 
     pub fn is_spike(&self, tenant_id: &str, rate: f64) -> bool {
